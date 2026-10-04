@@ -1,0 +1,101 @@
+/* show-me base, Meteora edition: readable defaults, light/dark, print-to-PDF rules.
+   Palette taken from the Meteora brand kit (github.com/MeteoraAg/brand-kit) and the
+   compiled stylesheet of app.meteora.ag on 2026-10-01: the symbol gradient
+   #F5BD00 → #F54B00 → #6E45FF, the wordmark #251D52 on white and #F9F9FB on dark,
+   the app's dark surfaces #12121C / #202031 / #2A2A3C with #434360 borders and
+   #6C6C89 / #9595B2 muted text, and Inter as the typeface. */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+
+:root {
+  color-scheme: light dark;
+  --bg: #f9f9fb;
+  --panel: #ffffff;
+  --panel-2: #f5f5ff;
+  --fg: #12121c;
+  --heading: #251d52;
+  --muted: #6c6c89;
+  --line: #e4e4ee;
+  --accent: #f54b00;
+  --accent-hover: #f76727;
+  --violet: #6e45ff;
+  --gold: #f5bd00;
+  --success: #1b996b;
+  --danger: #f04438;
+  --brand-gradient: linear-gradient(90deg, #f5bd00 0%, #f54b00 50%, #6e45ff 100%);
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12121c;
+    --panel: #202031;
+    --panel-2: #2a2a3c;
+    --fg: #f9f9fb;
+    --heading: #f9f9fb;
+    --muted: #9595b2;
+    --line: #434360;
+    --accent: #f54b00;
+    --accent-hover: #f76727;
+    --violet: #8664ff;
+    --gold: #f5bd00;
+    --success: #24c98d;
+    --danger: #f04438;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 32px 24px 64px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+main, .wrap { max-width: 900px; margin: 0 auto; }
+h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 4px; color: var(--heading); }
+h1::after {
+  content: "";
+  display: block;
+  width: 72px;
+  height: 3px;
+  margin-top: 10px;
+  border-radius: 2px;
+  background: var(--brand-gradient);
+}
+h2 { font-size: 17px; font-weight: 600; letter-spacing: -0.005em; margin: 32px 0 10px; color: var(--heading); }
+h3 { font-size: 14px; font-weight: 600; margin: 20px 0 6px; color: var(--heading); }
+p { margin: 0 0 12px; max-width: 68ch; }
+.sub, .muted { color: var(--muted); }
+.card, section.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 18px;
+  margin: 12px 0;
+}
+code, pre { font-family: var(--mono); font-size: 13px; }
+code { color: var(--accent); }
+pre code { color: inherit; }
+pre {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  overflow-x: auto;
+}
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 500; }
+svg { max-width: 100%; height: auto; }
+a { color: var(--accent); }
+a:hover { color: var(--accent-hover); }
+::selection { background: color-mix(in srgb, var(--accent) 25%, transparent); }
+
+@media print {
+  :root { --bg: #fff; --panel: #fff; --panel-2: #fff; --fg: #000; --heading: #000; --muted: #444; --line: #ccc; }
+  @page { margin: 14mm; }
+  body { padding: 0; font-size: 11pt; }
+  .card, pre { break-inside: avoid; }
+  h1, h2, h3 { break-after: avoid; }
+  .no-print { display: none !important; }
+}

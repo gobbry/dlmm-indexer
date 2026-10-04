@@ -1,0 +1,178 @@
+{
+  /* rpcUrl is required. You can switch between mainnet, devnet and localnet or use your own RPC URL. */
+  "rpcUrl": "https://api.devnet.solana.com", // mainnet: https://api.mainnet-beta.solana.com | devnet: https://api.devnet.solana.com | localnet: http://localhost:8899
+
+  /* dryRun is required. If true, transactions will be simulated and not executed. If false, transactions will be executed. */
+  "dryRun": true, // Set to false only after you understand what will happen
+
+  /* keypairFilePath is required and will be the payer + signer for all transactions */
+  "keypairFilePath": "./keypair.json",
+
+  /* computeUnitPriceMicroLamports is required and can be adjusted to fit your needs */
+  "computeUnitPriceMicroLamports": 100000,
+
+  /* quoteMint is required for the following actions:
+   * 1. damm-v1-create-pool
+   * 2. damm-v1-create-stake2earn-farm
+   * 3. damm-v1-lock-liquidity
+   * 4. damm-v1-lock-liquidity-stake2earn
+   * SOL: So11111111111111111111111111111111111111112 | USDC: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v | any other token address
+   */
+  "quoteMint": "So11111111111111111111111111111111111111112",
+
+  /* If you have a baseMint already created, you can specify it in the cli command via --baseMint flag. If you don't have a baseMint, you can create a new one using createBaseToken.
+   * Either use --baseMint flag or createBaseToken, but not both.
+   */
+  "createBaseToken": {
+    "supply": 1000000000, // total amount of base token to be minted
+    "decimals": 6, // decimals of the base token
+    // "tokenMintKeypairFilePath": "./mint-keypair.json", // path to token mint keypair if you have a specific keypair for the token mint. If not provided, a new keypair will be generated.
+    "name": "YOUR_TOKEN_NAME", // token name
+    "symbol": "YOUR_TOKEN_SYMBOL", // token symbol
+    "authorities": {
+      "mint": "YOUR_MINT_AUTHORITY_ADDRESS", // token mint authority address. <PublicKey | null>
+      "freeze": "YOUR_FREEZE_AUTHORITY_ADDRESS", // token freeze authority address. <PublicKey | null>
+      "update": "YOUR_UPDATE_AUTHORITY_ADDRESS" // token update authority address. <PublicKey | null>
+    },
+    /* Optional Metaplex Token Metadata Properties
+     * Read more about the properties here: https://www.metaplex.com/docs/smart-contracts/token-metadata
+     */
+    "sellerFeeBasisPoints": 0, // Royalty fee in basis points (0-10000)
+    "creators": null, // Array of creator objects of the token (optional)
+    "collection": null, // Collection info (optional)
+    "uses": null, // Usage restrictions (optional)
+    "metadata": {
+      // "uri": "https://gateway.irys.xyz/123456789", // if you already have a metadata URI created, you can specify it here
+
+      /* Only use the following parameters for createBaseToken if you don't have an existing metadata uri
+       * This will create an image uri and a new metadata uri and upload everything to Irys
+       */
+      "image": "./data/image/test-token.jpg", // this can be a URL of the image address (e.g. https://example.com/token-image.png) or the image file path (e.g. ./data/image/test-token.jpg)
+      "description": "YOUR_TOKEN_DESCRIPTION", // token description
+      "website": "https://example.com", // project website
+      "twitter": "https://x.com/yourproject", // twitter URL
+      "telegram": "https://t.me/yourproject" // telegram URL
+    }
+  },
+
+  /* dammV1Config is only used in the following actions:
+   * 1. damm-v1-create-pool
+   */
+  "dammV1Config": {
+    "baseAmount": 100, // base token amount
+    "quoteAmount": 0.001, // quote token amount
+    "tradeFeeNumerator": 2500, // pool fee in bps
+    "activationType": 1, // 0 - Slot | 1 - Timestamp
+    "activationPoint": null, // Activation time of the pool depending on activationType (Calculate in slots if activationType is 0 (slots) | Calculate in seconds if activationType is 1 (timestamp))
+    "hasAlphaVault": false // If true, the alpha vault will be created after the pool is created
+  },
+
+  /* dammV1LockLiquidity is only used in the following actions:
+   * 1. damm-v1-lock-liquidity
+   * 2. damm-v1-lock-liquidity-stake2earn
+   */
+  /* dammV1Swap is only used in the following actions:
+   * 1. damm-v1-swap (requires --poolAddress flag)
+   */
+  "dammV1Swap": {
+    "inputMint": "So11111111111111111111111111111111111111112", // mint you are paying with; must be one of the pool's two mints
+    "amountIn": 0.1, // amount of inputMint to swap, in human token units
+    "slippage": 0.5 // slippage tolerance in percent (0.5 = 0.5%)
+  },
+
+  "dammV1LockLiquidity": {
+    "allocations": [
+      {
+        "percentage": 80, // percentage of the LP tokens that will be allocated to address 1
+        "address": "YOUR_ADDRESS_1" // address 1
+      },
+      {
+        "percentage": 20, // percentage of the LP tokens that will be allocated to address 2
+        "address": "YOUR_ADDRESS_2" // address 2
+      }
+    ]
+  },
+
+  /* stake2EarnFarm is only used in the following actions:
+   * 1. damm-v1-create-stake2earn-farm
+   */
+  "stake2EarnFarm": {
+    "topListLength": 100, // Maximum number of top stakers eligible for fee rewards (minimum 50, maximum 1000)
+    "unstakeLockDurationSecs": 25200, // 7-hour cooldown period before unstaked tokens can be withdrawn
+    "secondsToFullUnlock": 86400, // 24-hour period for locked fees to fully drip/release to stakers
+    "startFeeDistributeTimestamp": 1753441790 // Start date for fee distribution, unix seconds (this value = 2025-07-25 11:09:50 UTC). STALE PLACEHOLDER (a date in the past) — replace with a future unix timestamp before running, e.g. Math.floor(Date.now() / 1000) + 86400 for 24h from now — a past value overflows the on-chain fee-drip math
+  },
+
+  /* stake2EarnStake is only used in the following action:
+   * 1. stake2earn-stake (requires --poolAddress flag; the pool's farm must already exist)
+   */
+  "stake2EarnStake": {
+    "amount": 100 // amount of the stake mint to stake, in human (stake-token) units
+  },
+
+  /* stake2EarnClaim is only used in the following action:
+   * 1. stake2earn-claim-fee (requires --poolAddress flag)
+   */
+  "stake2EarnClaim": {
+    "maxFee": null // null = claim all pending fees (u64::MAX); or a raw base-unit ceiling applied to both feeA and feeB (they can use different decimals)
+  },
+
+  /* stake2EarnUnstake is only used in the following action:
+   * 1. stake2earn-unstake (requires --poolAddress flag)
+   */
+  "stake2EarnUnstake": {
+    "amount": 50 // amount of the stake mint to unstake, in human (stake-token) units; must not exceed the wallet's current staked amount
+  },
+
+  /* stake2EarnWithdraw is used by the following actions:
+   * 1. stake2earn-withdraw (requires --poolAddress flag)
+   * 2. stake2earn-cancel-unstake (requires --poolAddress flag; reuses this same block)
+   */
+  "stake2EarnWithdraw": {
+    "unstakeKey": null // unstake account pubkey logged by stake2earn-unstake ("SAVE THIS"); null = list this wallet's open unstake requests and stop
+  },
+
+  /* alphaVault is only used in the following actions:
+   * 1. damm-v1-create-pool
+   * There are 2 types of alpha vault: First Come First Serve (FCFS) and Prorata.
+   */
+  "alphaVault": {
+    "poolType": "dynamic", // DLMM = dlmm | DAMM v1 = dynamic | DAMM v2 = damm2
+    "alphaVaultType": "fcfs", // FCFS = fcfs | Prorata = prorata
+
+    /* Only use the following parameters for alphaVaultType: fcfs
+     * 1. maxDepositCap
+     * 2. individualDepositingCap
+     */
+    "maxDepositCap": 10000, // Maximum total amount (in quote token) that can be deposited across all users in the vault
+    "individualDepositingCap": 1, // Maximum amount (in quote token) that each individual user can deposit
+
+    /* Only use the following parameters for alphaVaultType: prorata
+     * 1. maxBuyingCap
+     */
+    // "maxBuyingCap": 10000, // Maximum total amount (in quote token) that can be bought across all users in the vault
+
+    "depositingPoint": 1733626299, // When users can start depositing depending on pool's activationType (Calculate in slots if activationType is 0 (slots) | Calculate in seconds if activationType is 1 (timestamp)) — the shipped value is a STALE PLACEHOLDER in the past — replace it before running
+    "startVestingPoint": 1746808201, // When token vesting begins and users can start claiming their vested tokens depending on pool's activationType (Calculate in slots if activationType is 0 (slots) | Calculate in seconds if activationType is 1 (timestamp)) — the shipped value is a STALE PLACEHOLDER in the past — replace it before running
+    "endVestingPoint": 1746808201, // When token vesting ends and all tokens become fully claimable depending on pool's activationType (Calculate in slots if activationType is 0 (slots) | Calculate in seconds if activationType is 1 (timestamp)) — the shipped value is a STALE PLACEHOLDER in the past — replace it before running
+    "escrowFee": 0, // Fee amount (in quote token) charged when creating a stake escrow account
+    "whitelistMode": "permissionless" // Whitelist mode: permissionless | permissioned_with_merkle_proof | permissioned_with_authority
+
+    /* Optional Configuration: whitelistFilePath
+     * Only use when whitelistMode is permissioned_with_merkle_proof or permissioned_with_authority
+     */
+    // "whitelistFilepath": "./data/whitelist_wallet.csv", // Optional path to CSV file containing whitelisted wallet addresses and their deposit caps (format: wallet,deposit_cap)
+
+    /* Optional Configuration: merkleProofBaseUrl, chunkSize, kvProofFilepath, cloudflareKvProofUpload
+     * Only use when whitelistMode is permissioned_with_merkle_proof
+     */
+    // "merkleProofBaseUrl": "https://example.workers.dev/", // Base URL endpoint where merkle proofs are stored and can be retrieved for whitelisted wallet verification
+    // "chunkSize": 1000, // Optional batch size for processing large whitelist files or merkle tree operations to avoid memory/performance issues
+    // "kvProofFilepath": "./data/kv_proofs", // Optional path to key-value file storing pre-computed merkle proofs for whitelisted addresses
+    // "cloudflareKvProofUpload": {
+    //   "kvNamespaceId": "YOUR_KV_NAMESPACE_ID",
+    //   "accountId": "YOUR_ACCOUNT_ID",
+    //   "apiKey": "YOUR_API_KEY"
+    // }
+  }
+}

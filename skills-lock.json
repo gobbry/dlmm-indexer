@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "skills": {
+    "tiger-style": {
+      "source": "anthropic-skills (Claude Code synced skill)",
+      "sourceType": "local-copy",
+      "skillPath": ".agents/skills/tiger-style/SKILL.md",
+      "computedHash": "6ef4fdab952747a8d21abb6f8972d44f459c96109d35d36dd84845a4d659d8ce"
+    },
+    "rust-conventions": {
+      "source": "local",
+      "sourceType": "local",
+      "skillPath": ".agents/skills/rust-conventions/SKILL.md",
+      "computedHash": "3efb170e87c4ef7e3e3719e19f8fe7bd5dac3caab1fd77869f8d4ac4fc7d1ffc"
+    },
+    "test-audit": {
+      "source": "openclaw/openclaw",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/test-audit/SKILL.md",
+      "computedHash": "01c421239797a8950fe1287f293d2e05f127e69ac457d1b9cdf9b296ac77eacd",
+      "upstreamCommit": "7e1de914ccb3797270235568c34784bef70f6997"
+    },
+    "grill-with-docs": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/grill-with-docs/SKILL.md",
+      "computedHash": "c7176600a8bffc9f359102cb041b6686387618b8e1434ba484dd708d45df6d5e",
+      "vendoredVia": "ft-market-automation"
+    },
+    "grilling": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/grilling/SKILL.md",
+      "computedHash": "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2"
+    },
+    "grill-me": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/grill-me/SKILL.md",
+      "computedHash": "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637"
+    },
+    "meteora": {
+      "source": "MeteoraAg/meteora-invent",
+      "sourceType": "github",
+      "skillPath": "skills/meteora/SKILL.md",
+      "computedHash": "7dfdd571ece5c0a432e1435e2a59088bbc4db1d0a7f51d4e68124c126dead8b2",
+      "upstreamCommit": "dd77ef3d5aede3f0ff21d566d052097200417f5e"
+    },
+    "show-me": {
+      "source": "~/.agents/skills/show-me (user-level local skill); base.css re-themed to the Meteora brand palette in this repo",
+      "sourceType": "local-copy",
+      "skillPath": ".agents/skills/show-me/SKILL.md",
+      "computedHash": "ca7215b713864fc54df0cfd9f7d04a437e3715519763c36bad7a37a04765d0bb"
+    },
+    "metclanker": {
+      "source": "local",
+      "sourceType": "local",
+      "skillPath": ".agents/skills/metclanker/SKILL.md",
+      "computedHash": "a665c47509d2c534057b0d1e9425a2eefc3aad2094b36a23d297dbefe5485ae1"
+    }
+  }
+}
