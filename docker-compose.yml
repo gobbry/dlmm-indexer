@@ -1,0 +1,78 @@
+name: dlmm
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dlmm
+      TS_TUNE_MEMORY: 2GB
+    mem_limit: 2g
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d dlmm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  indexer:
+    build: .
+    command: ["indexer", "run"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_DSN: postgres://postgres:postgres@db:5432/dlmm
+      RUST_LOG: ${RUST_LOG:-info}
+    # The archive (archive/run.sh) runs on the host; Docker Desktop resolves this name by
+    # itself, Linux needs the mapping.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      # The processor touches /tmp/healthy on every commit, the tail poll on every tick.
+      test: ["CMD-SHELL", "test -f /tmp/healthy && test $$(( $$(date +%s) - $$(stat -c %Y /tmp/healthy) )) -lt 120"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  api:
+    build: .
+    command: ["api"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Same DSN as the indexer by default. The API only reads, except POST /v1/backfills, which
+      # inserts one slot_range_job row (RPC_URL from .env resolves its slot); a read-only role
+      # here serves every read and refuses backfills.
+      DB_DSN: postgres://postgres:postgres@db:5432/dlmm
+      # Pinned here so a host-oriented value in .env (127.0.0.1) cannot hide the port.
+      API_LISTEN_ADDRESS: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8080:8080"
+    depends_on:
+      indexer:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  db_data:

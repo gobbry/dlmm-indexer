@@ -22,7 +22,7 @@ Three deployables, one database, one direction of data flow.
    │   └─ also the LIVE source when no Geyser endpoint is configured (RPC tail)             │
    │  PriceFeed ──writes price──▶ TimescaleDB; ──on_prices_filled──▶ BlockProcessor         │
    └────────────────────────────────────────────────────────────────────────────────────────┘
-                                                      │ reads only (api_reader role)
+                                                      │ reads only (SELECT)        
                                                       ▼
                                    ┌──────────── API (axum binary) ────────────┐
                                    │ /v1/health /v1/pools                      │
@@ -94,7 +94,7 @@ normalised.
 ### 2.2 Live source: RPC tail (automatic fallback, and the grader's path)
 
 The task's README must let a grader run `docker compose up` and see live swaps in under ten
-minutes on a free RPC. A Geyser credential cannot be assumed. When `GEYSER_ENDPOINT` is
+minutes on a free RPC. A Geyser credential cannot be assumed. When `GEYSER_URL` is
 unset, or whenever the Geyser stream is disconnected or stalled, `RangeFiller` runs in
 tail mode: every 2 s it lists `getBlocks(cursor + 1, cursor + window)`, with window
 `max(64, tick_seconds / 0.2)` slots (0.2 s is faster than any pace measured: mainnet slots ran
@@ -117,7 +117,7 @@ plus an optional reconciler that samples recent slots over RPC and compares swap
 Cost on Helius free tier (10 requests per second, 1M credits a month, `getBlock` one
 credit): about 3.7 `getBlock` calls per second at the measured 0.27 s slots (one constant,
 `SLOT_MILLISECONDS_OBSERVED = 270`, from which the live-share minimum is derived: 5 live
-requests a second, so `RPC_REQUESTS_PER_SECOND_MAX` of 7 or more) and roughly 30 MB/s before
+requests a second, so `RPC_RPS_MAX` of 7 or more) and roughly 30 MB/s before
 gzip, which is sustainable for a demo and exhausts the monthly credits in about 3 days of
 continuous tailing. Tick-to-data latency is finalization (about 13 s) plus the poll interval. This is
 the concrete "what a free tier can and cannot do" answer; Geyser removes the poll and the
@@ -157,13 +157,14 @@ crash at any point leaves the table describing exactly what is indexed.
 
 `slot_range_job { id, start_slot, end_slot, next_slot, blocked_reason, completed_at }`
 describes outstanding history; jobs carry the same exclusion constraint as coverage, so two
-jobs never claim one slot. Jobs are opened and completed only by the reconciler, a 10 s tick
+jobs never claim one slot. Jobs are opened (but for a backfill job, which the API inserts,
+below) and completed only by the reconciler, a 10 s tick
 inside the `BlockProcessor` loop (`tokio::select!` over the tick and the two inboxes, tick
-first), so the processor stays the single writer. One statement, `reconcile(floor,
-archive_window)`:
+first), so the processor stays the single writer of swaps and coverage. One statement, `reconcile(archive_window)`:
 
-- Holes are the gaps between consecutive coverage ranges (a `lag` window over `start_slot`)
-  plus, when `floor` is set and below the lowest range, `[floor, lowest.start_slot - 1]`.
+- Holes are the gaps between consecutive coverage ranges (a `lag` window over `start_slot`),
+  and nothing else: there is no floor, so history below the lowest range is owed only once a
+  backfill job for it exists (below).
 - A hole that straddles an edge of the archive window is cut before its bottom and after its
   top (below), so every job lies wholly on one side.
 - A hole overlapped by a job with `completed_at IS NULL` (open or blocked) is already owned
@@ -183,11 +184,28 @@ archive_window)`:
 It returns the counts it opened and completed for the `coverage_reconciled` log line and
 nudges the filler (`FillerMessage::OnJobsOpened`) when it opened any. Holes from any cause
 are caught the same way: a tail jump past 150 slots of lag, a block neither live source
-delivered, a restart, a source that was down. `floor` is `BACKFILL_FROM` (RFC 3339)
-resolved at every boot, on the idle live lane before the live sources start, by bisection
-over `getBlocks` pages to the first slot at or after the timestamp that holds a block. The
-floor job is opened at the first tick after the first block commits; a restart resolves the
-same floor and finds the job open or its range covered, so there is never a second one.
+delivered, a restart, a source that was down.
+
+Backfill is a job the API inserts, not configuration: `POST /v1/backfills` with
+`{"from": "<RFC 3339>"}` (§8) resolves the instant, by bisection over `getBlocks` pages on
+the API's own `RpcGateway` (`RPC_URL`, `RPC_RPS_MAX`), to the first slot at or after it that
+holds a block, then inserts one job `[from_slot, lowest.start_slot - 1]` with
+`next_slot = from_slot` and `end_kind = 'block'`, in one `INSERT … SELECT` that reads the
+lowest coverage range itself. The end is a block: a range's start minus one is the parent of
+its first block. From then on it is an ordinary job: the filler walks it, its blocks join
+coverage to the range above, and the reconciler completes it. The exclusion constraint makes
+a second backfill over the same slots a 409, not a duplicate. The API inserts the job uncut
+(it does not read the archive window); the reconciler's next tick cuts it. Any open job no
+block of which has committed (`next_slot = start_slot`, not blocked) and that straddles
+`bottom - 1` or `top` goes through the same cut CTE as a hole, in the same statement: the job
+is deleted and its pieces inserted (the insert reads the delete's output, so the exclusion
+constraint sees the job gone), the piece ending at `bottom - 1` as `archive_lower_cut`, the
+piece ending at `top` on a block, the last piece with the job's own `end_kind`, logged as
+`backfill_job_split`. So a request older than a week is split at the week line and its old
+part goes to the archive. Until that tick neither lane reads such a job, so the provider
+never starts the archive's share; a job already walking keeps its lane, whose parent chain
+vouches for the rest. A window that arrives or moves later splits an unstarted job the same
+way on the first tick that knows it.
 
 The filler reads the table as its work queue: at boot and every 10 s it loads open jobs
 (`completed_at IS NULL AND blocked_reason IS NULL AND next_slot <= end_slot`) ordered by
@@ -220,8 +238,8 @@ reconciler finds its range covered.
 each fetched block's `parent_slot` must equal the previously fetched slot, and a job's first
 block (at its start or on resume) must name a parent below `next_slot`: a parent at or after
 it is a block the listing omitted, while a parent below it is the chain's own proof that the
-slots between are skipped (the end block of the range below, a skipped slot before the
-floor's block, or a job cut at an archive window edge, below). A mismatch
+slots between are skipped (the end block of the range below, a skipped slot before a
+backfill's first block, or a job cut at an archive window edge, below). A mismatch
 means a slot `getBlocks` omitted is missing from this node's storage, not skipped. The job
 is then marked `blocked_reason = 'missing_in_storage:<slot>'`, the filler moves on, health
 reports `blocked_job_count`, and the operator points `RPC_URL` at a node with history (or
@@ -244,7 +262,7 @@ set, a second `RpcGateway` talks to an Old Faithful `faithful-cli rpc` server (�
 **window** is `[bottom, top]`: `bottom` is `getFirstAvailableBlock`, and `top` is the block
 on the week line, the first block at or after `now - ARCHIVE_SAFE_LAG_SECONDS` (604,800 s,
 one week, defined in time because the slot rate drifts), found by the same `getBlockTime`
-bisection as the floor but run on the archive and never probing below `bottom` (the archive
+bisection as a backfill's start but run on the archive and never probing below `bottom` (the archive
 answers each probe in under a millisecond, and a slot outside its epochs with a retried
 `-32004`); when even the archive's newest block is older than a week, `top` is that block.
 `top` is therefore always a block. A week, because an epoch is published only after it ends
@@ -351,7 +369,7 @@ for very selective programs, not the default; see §12.
   honour `Retry-After`. Both verified maintained on 2026-10-03; `tower`'s limiter (fixed
   window), `backoff` (unmaintained since 2021) and `reqwest-retry` (ignores `Retry-After`,
   cannot see JSON-RPC bodies) were rejected.
-- RPC: two governor limiters from one `RPC_REQUESTS_PER_SECOND_MAX` (minimum 2): the live
+- RPC: two governor limiters from one `RPC_RPS_MAX` (minimum 2): the live
   tail gets ceil(60 percent) and fills plus decimals fetches the rest, so a long fill never
   starves live blocks (found in gauntlet round 1). Burst 2 because governor's default burst
   equals the rate and would spike a provider's window counter; the permit is acquired
@@ -383,17 +401,18 @@ client, its limiter, its retry policy and its environment config. There are thre
 RPC tail, the filler's provider lane and the processor's decimals fetch; the archive instance
 the filler's archive lane's alone) and `BinanceGateway` (owned by `PriceFeed`). `RpcGateway` is built per endpoint, an
 `Endpoint { Provider, Archive }` kind: the provider from `RPC_URL` and
-`RPC_REQUESTS_PER_SECOND_MAX`, and, when `ARCHIVE_RPC_URL` is set, the archive from it and
-`ARCHIVE_REQUESTS_PER_SECOND_MAX` (default 20). The kind changes four behaviours: listing
+`RPC_RPS_MAX`, and, when `ARCHIVE_RPC_URL` is set, the archive from it and
+`ARCHIVE_RPS_MAX` (default 20). The kind changes four behaviours: listing
 (every slot, no request, on the archive), the `-32009` class, the fetch window (12 in flight
 on the archive), and what a job does when its end block never arrives (§2.5); the
 `getBlock` parameters, timeouts, `backon` retry, `governor` limiter and decoder are shared.
 The archive itself is `archive/run.sh`: the `faithful-cli` release binary for the host and
 hardcoded epoch configs (`archive/epochs/N.yml`, CID and five index URLs each), run beside
-compose because no official image exists. The supported transaction version is a ceiling per
-ingestion gateway, read from the environment: `RPC_TRANSACTION_VERSION_MAX` is passed
-through as `maxSupportedTransactionVersion`, and `GEYSER_TRANSACTION_VERSION_MAX` is
-enforced by the mapper because the stream has no such parameter; the proto carries no
+compose because no official image exists. The supported transaction version is one ceiling
+for every ingestion gateway, `TRANSACTION_VERSION_MAX` from the environment (a version is
+supported across every source or not at all): RPC passes it through as
+`maxSupportedTransactionVersion`, and the Geyser mapper enforces it because the stream has no
+such parameter; the proto carries no
 version number, only `versioned` and an optional `config`, so the mapper reads legacy for
 `!versioned`, v0 for `versioned` without `config`, v1 with `config` (*to confirm* against
 agave's v1 encoding). A version above the ceiling stops the process: supporting a new version means a new mapper and a re-index, so
@@ -511,7 +530,7 @@ quote assets' decimals, which are constants (SOL 9, USDC 6, USDT 6).
 |---|---|---|---|
 | `GeyserSource` | `GeyserGateway` (stream typestate, backoff), stall timer | stream messages, `Shutdown` | `on_block(Live)` |
 | `RangeFiller` | `RpcGateway` (client, governor limiter, backon retry, version ceiling), open job list, current page; in tail mode the per-tick `getBlocks` listing | job scan tick, `OnJobsOpened` nudge, `Shutdown` | `on_block(Fill)` or `on_block(Live)` |
-| `BlockProcessor` | the DB connection (sole writer of swap, projection, coverage and job tables), coverage floor, pool and token caches, quote allowlist, popped block awaiting retry | `on_block`, `on_prices_filled`, reconcile tick (10 s), `Shutdown` | `OnJobsOpened` nudge, decimals fetch requests |
+| `BlockProcessor` | the DB connection (sole writer of swap, projection and coverage tables, and of every job but the API's backfill insert), pool and token caches, quote allowlist, popped block awaiting retry | `on_block`, `on_prices_filled`, reconcile tick (10 s), `Shutdown` | `OnJobsOpened` nudge, decimals fetch requests |
 | `PriceFeed` | `BinanceGateway` (client, weighted limiter, pause-until, retry), sweep cursor | tick (15 s), sweep tick (60 s), `Shutdown` (its own control channel) | `on_prices_filled(MinuteRange)` on the fill channel, `try_send` |
 
 Channel capacities are explicit newtypes: live blocks 64, fill blocks 16, nudges 16,
@@ -606,7 +625,7 @@ priced/unpriced swap state (pricing is SQL).
 `MintAddress([u8; 32])`, `UserAddress([u8; 32])`, `AccountAddress([u8; 32])`,
 `TokenAmountRaw(u64)`, `Decimals(u8)`, `SwapOrdinal(u16)`, `StackHeight(u8)`,
 `SlotRange { start, end_inclusive }`, `MinuteRange`, `JobId(i64)`, `PriceUsd(Decimal)`,
-`ChannelCapacity(usize)`, `RequestsPerSecondMax(u32)`, `TransactionIndex(u16)`,
+`ChannelCapacity(usize)`, `RpsMax(u32)`, `TransactionIndex(u16)`,
 `TransactionVersionMax(u8)`, `LogPosition { slot, transaction_index, swap_ordinal }`,
 `BinId(i32)`, `HourBucket(UnixSeconds)`.
 
@@ -647,19 +666,24 @@ side, 2.1 percent has no SOL, USDC or USDT side. Three series price about 98 per
 
 **Quote leg** (pure): the allowlist is three mints, never symbols (a fake "USDT" pool
 exists). Exactly one allowlisted side is the quote; both (SOL-USDC) picks the stable;
-neither leaves `quote_asset` null and the swap unpriced.
+neither leaves `quote_asset_symbol` null and the swap unpriced.
 
-**Deterministic price** (squashed 2026-10-05). A `price` row is keyed `(asset, ts, source)`,
+**Deterministic price** (squashed 2026-10-05). A `price` row is keyed `(asset_symbol, ts, source)`,
 where `ts` is the instant the price was observed: for a Binance one-minute candle, its close
 time (open plus 60 s). The price of a swap at time `t` is the latest row in the half-open
 window `(t - PRICE_AGE_MAX_SECONDS, t]` (60 s) for its quote asset and an eligible source:
-the SQL function `price_at(asset, t, sources, age)` (in the migration, inlined by the planner
-onto `price_pkey`), which both the swap insert and the reprice sweep call through a
-`LATERAL` join, so the two paths cannot drift apart. It orders `ts DESC, (source =
-sources[1]) DESC, source`: ties on `ts` go to the configured market by name, not by enum
+a shared SQL fragment, not a function: `price_lookup_sql!` in `core/src/store/price.rs`, one
+`LATERAL` subquery spliced at compile time into both the swap insert and the reprice sweep
+with the same bind positions (`$1` the eligible sources, `$2` the age), so the two paths
+cannot drift apart; the plan is the same index scan on `price_pkey` a planner-inlined SQL
+function gave, and the rule sits next to the Rust that binds it instead of behind a
+migration (squashed 2026-10-05 from a `price_at` function). The USD arithmetic is the second
+such fragment, `usd_value_sql!` (`quote_amount * close_usd / 10^decimals`, exact `NUMERIC`).
+It orders `ts DESC, (source = sources[1]) DESC, source`: ties on `ts` go to the configured market by name, not by enum
 order, so a market appended to the enum later still wins them. On the one-minute grid this is exactly the previous rule, the close of the
 last candle closed at `t`, and a future price is never used. Eligible sources are
-`PRICE_SOURCE` (env, default `binance`, a `price_source` market value) plus `peg` and
+the market (`PriceSource::Binance`, a code constant: configurable sources were
+misconfigurable, so onboarding a market is a code change) plus `peg` and
 `carried_forward`, which the feed derives itself (USDT's 1, and the previous close repeated
 over an exchange gap) and which are part of the market's series rather than rival sources.
 Rows are immutable: `PriceFeed` stores only closed candles, and if Binance has no candle for
@@ -677,7 +701,7 @@ fetch never runs inside a block's transaction.
 decimal strings, up to 1000 candles per call); USDC from `USDCUSDT`; USDT is 1 with `source
 = 'peg'`. No API key: Binance limits public market data by IP (6000 weight per minute) and a
 key changes nothing for klines; our load is one call every 15 s plus 44 calls for a month of
-backfill. `PRICE_API_BASE_URL` defaults to `https://data-api.binance.vision`, the host
+backfill. `BINANCE_DATA_API_URL` defaults to `https://data-api.binance.vision`, the host
 Binance's docs name for key-less market data, because `api.binance.com` returns HTTP 451 to
 US egress; `api.binance.us` serves the same shape (*likely*) and the `data.binance.vision`
 daily CSV zips are the bulk fallback. Jupiter's price API has no history and Birdeye needs a
@@ -687,12 +711,12 @@ block of that minute is indexed) and one-hop pool pricing for the 2 percent of v
 pools with no quote asset.
 
 **Filling.** Every 60 s and at boot the sweep asks for the oldest and newest
-`block_time` of `swap WHERE volume_usd IS NULL AND quote_asset IS NOT NULL` (each end an
+`block_time` of `swap WHERE volume_usd IS NULL AND quote_asset_symbol IS NOT NULL` (each end an
 ordered scan of the partial `swap_unpriced` index that stops at its first row, stepping over
 the minutes already found unpriceable, which the feed keeps for a week per quote asset),
 fetches the missing minutes
 in chunks of 1000, writes them, and sends `on_prices_filled(range)`. The processor runs one
-`UPDATE ... RETURNING` over unpriced swaps in that range with the same SQL function and
+`UPDATE ... RETURNING` over unpriced swaps in that range with the same SQL fragments and
 projects the returned rows as `volume_usd + v, unpriced_swap_count - 1`, in the same
 transaction. Null-only is sufficient because a priced row can never change. This one
 mechanism covers live stalls, gap fills, backfills and crashes.
@@ -707,14 +731,16 @@ bucket is empty or wholly unpriced; a zero is never shown for an unknown.
 
 ## 6. Data schema (TimescaleDB 2.20 or newer, pg17)
 
-Image `timescale/timescaledb:2.30.x-pg17` (the `WITH (tsdb.*)` form needs 2.20+; exact
-tag *to confirm* when pinning). TimescaleDB has one job here: chunking and later
+Image `timescale/timescaledb:latest-pg17` (the `WITH (tsdb.*)` form needs 2.20+): always
+the latest TimescaleDB on Postgres 17, and the per-major tag keeps an existing data volume
+readable (author, 2026-10-05). TimescaleDB has one job here: chunking and later
 compressing the event log. Projections are plain tables maintained by the processor, so
 there are no continuous aggregates, refresh policies or real-time unions. Verified rules
 that shaped the DDL: a unique index on a hypertable must contain the partition column, and
 `ON CONFLICT DO NOTHING ... RETURNING` works on hypertables.
 
 ```sql
+-- migrations/0001_core.sql
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 -- Exclusion constraints over slot ranges.
 CREATE EXTENSION IF NOT EXISTS btree_gist;
@@ -724,8 +750,9 @@ CREATE DOMAIN solana_address   AS TEXT CHECK (VALUE ~ '^[1-9A-HJ-NP-Za-km-z]{32,
 CREATE DOMAIN solana_signature AS TEXT CHECK (VALUE ~ '^[1-9A-HJ-NP-Za-km-z]{86,88}$');
 -- A domain names a range, never a unit: the unit (base units, a rate x 1e9) is in the column.
 CREATE DOMAIN u64              AS NUMERIC(20,0) CHECK (VALUE >= 0 AND VALUE <= 18446744073709551615);
+-- An upper-case ticker, not an enum: onboarding a quote asset is a Rust variant, never a migration.
+CREATE DOMAIN asset_symbol     AS TEXT CHECK (VALUE ~ '^[A-Z0-9]{2,16}$');
 
-CREATE TYPE quote_asset      AS ENUM ('sol', 'usdc', 'usdt');
 CREATE TYPE swap_direction   AS ENUM ('x_to_y', 'y_to_x');
 CREATE TYPE fee_side         AS ENUM ('input', 'output');
 CREATE TYPE fee_token        AS ENUM ('x', 'y');
@@ -774,7 +801,7 @@ CREATE TABLE swap (
     fee_side             fee_side,
     fee_token            fee_token,
     swap2_event_payload  BYTEA,                      -- raw Swap2Evt for layouts not decoded
-    quote_asset          quote_asset,                -- null = unpriceable pool
+    quote_asset_symbol   asset_symbol,               -- null = unpriceable pool
     quote_amount         u64,                        -- base units of the quote leg
     price_ts             TIMESTAMPTZ,                -- ts of the price row that priced it
     volume_usd           NUMERIC(38,18),             -- null = unpriced (yet)
@@ -793,7 +820,7 @@ CREATE INDEX swap_pool_time  ON swap (pool, block_time DESC);
 -- Unique, so "strictly after a position" paging can never skip a tie; block_time is in it
 -- because a hypertable's unique index must hold the partition column.
 CREATE UNIQUE INDEX swap_log_order ON swap (slot, transaction_index, swap_ordinal, block_time);
-CREATE INDEX swap_unpriced   ON swap (block_time) WHERE volume_usd IS NULL AND quote_asset IS NOT NULL;
+CREATE INDEX swap_unpriced   ON swap (block_time) WHERE volume_usd IS NULL AND quote_asset_symbol IS NOT NULL;
 
 CREATE TABLE decode_failure (
     block_time   TIMESTAMPTZ NOT NULL,
@@ -806,11 +833,11 @@ CREATE TABLE decode_failure (
 -- ts is the instant the price was observed (a one-minute candle's close time), so a swap
 -- takes the latest row at or before its block_time and never a price from its future.
 CREATE TABLE price (
-    asset       quote_asset   NOT NULL,
-    ts          TIMESTAMPTZ   NOT NULL,
-    source      price_source  NOT NULL,
-    close_usd   NUMERIC(18,8) NOT NULL,
-    PRIMARY KEY (asset, ts, source)
+    asset_symbol  asset_symbol  NOT NULL,
+    ts            TIMESTAMPTZ   NOT NULL,
+    source        price_source  NOT NULL,
+    close_usd     NUMERIC(18,8) NOT NULL,
+    PRIMARY KEY (asset_symbol, ts, source)
 );
 
 -- The slot ranges fully indexed: every block write covers (parent_slot, slot]. The top range's
@@ -840,25 +867,11 @@ CREATE TABLE slot_range_job (
 CREATE INDEX slot_range_job_open ON slot_range_job (end_slot DESC)
     WHERE completed_at IS NULL AND blocked_reason IS NULL AND next_slot <= end_slot;
 
-CREATE FUNCTION usd_value(amount_raw NUMERIC, decimals SMALLINT, close_usd NUMERIC)
-RETURNS NUMERIC LANGUAGE sql IMMUTABLE AS $$
-    SELECT amount_raw * close_usd / power(10::numeric, decimals)
-$$;
+-- No SQL functions: the price lookup and the USD arithmetic are Rust-side SQL fragments (§5).
 
--- The one price rule, shared by the swap insert and the reprice sweep (§5).
-CREATE FUNCTION price_at(price_asset quote_asset, at_time TIMESTAMPTZ, sources price_source[],
-                         age_seconds BIGINT)
-RETURNS TABLE (ts TIMESTAMPTZ, close_usd NUMERIC) LANGUAGE sql STABLE AS $$
-    SELECT p.ts, p.close_usd
-    FROM price p
-    WHERE p.asset = price_asset
-      AND p.source = ANY (sources)
-      AND p.ts <= at_time
-      AND p.ts > at_time - age_seconds * INTERVAL '1 second'
-    ORDER BY p.ts DESC, (p.source = sources[1]) DESC, p.source
-    LIMIT 1
-$$;
 
+-- migrations/0002_projections.sql: derived from the swap log and rebuildable from it, so the
+-- projections get their own migration.
 -- Projections: read models maintained by the processor with value = value + delta.
 CREATE TABLE pool_volume_1h (
     bucket               TIMESTAMPTZ NOT NULL,    -- hour start, UTC
@@ -897,16 +910,6 @@ CREATE TABLE projection (
 );
 INSERT INTO projection (name, version)
 VALUES ('pool_volume_1h', 1), ('pool_volume_1d', 1), ('pool_stats', 1);
-
--- api_reader is created by the db container's init script (roles are cluster-global and
--- sqlx migrations cannot read the environment); the migration only grants, if the role exists.
-DO $$ BEGIN
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'api_reader') THEN
-    GRANT SELECT ON pool, token, swap, price, slot_coverage, slot_range_job,
-                    decode_failure, pool_volume_1h, pool_volume_1d, pool_stats, projection
-      TO api_reader;
-  END IF;
-END $$;
 ```
 
 
@@ -933,8 +936,16 @@ Reasons for non-obvious choices:
   2026-10-05 from two domains with the same range). They put the invariants the Rust
   newtypes already enforce into the schema a reviewer reads, at no runtime cost.
 - `price` keeps `source` in the key so a second market can be stored beside the first
-  and chosen by `PRICE_SOURCE` without rewriting rows; the lookup's range scan on
-  `(asset, ts)` is served by the primary key.
+  and chosen by changing the market constant, without rewriting rows; the lookup's range scan on
+  `(asset_symbol, ts)` is served by the primary key.
+- Quote assets are an `asset_symbol` ticker (`SOL`, `USDC`, `USDT`), not an enum (author,
+  2026-10-05): Rust's `QuoteAsset` is already the allowlist the writer checks (mint,
+  decimals, Binance symbol), so a SQL enum was a second copy that made onboarding an asset
+  a migration; the domain keeps only the shape check.
+- No SQL functions (2026-10-05): `price_at` and `usd_value` became the shared Rust SQL
+  fragments `price_lookup_sql!` and `usd_value_sql!`. The plan is unchanged (both inlined
+  before), the arithmetic is the same exact `NUMERIC`, and every rule that prices a swap is
+  read in one Rust file.
 - Update granularity: projection rows are upserted once per block for the keys that
   block touched, never per swap; an idle pool is never written. A pool active in every
   block gets a HOT update of its `pool_stats` row per block, which autovacuum absorbs;
@@ -946,8 +957,8 @@ Reasons for non-obvious choices:
 **Insert, in prose.** One statement per block inserts all swaps via `unnest` arrays with
 `ON CONFLICT (signature, swap_ordinal, block_time) DO NOTHING RETURNING`, computing
 `volume_usd` through a `LEFT JOIN LATERAL` that takes the latest eligible `price` row with
-`ts` in `(block_time - 60 s, block_time]` (§5) and `usd_value(quote_amount, quote_decimals,
-p.close_usd)`. The reprice sweep uses the same lookup in a CTE, since an `UPDATE` target
+`ts` in `(block_time - 60 s, block_time]` (§5) and `quote_amount * close_usd /
+10^quote_decimals` (the two shared fragments of §5). The reprice sweep uses the same lookup in a CTE, since an `UPDATE` target
 cannot be referenced from a `LATERAL` in its own `FROM`. The returned rows feed `project`; the deltas are applied with
 one `INSERT ... ON CONFLICT (pool, bucket) DO UPDATE SET swap_count = pool_volume_1h.swap_count
 + EXCLUDED.swap_count, ...` per projection table.
@@ -1076,7 +1087,9 @@ pub struct TokenRecord { pub mint: MintAddress, pub decimals: Option<Decimals> }
 
 // core/src/domain/job.rs
 pub struct SlotRangeJob { pub id: JobId, pub range: SlotRange, pub next_slot: Slot }   // an open job, as the filler reads it
-pub struct ReconcileSummary { pub opened_job_count: u32, pub completed_job_count: u32 }
+pub struct ReconcileSummary { pub opened_job_count: u32, pub completed_job_count: u32, pub splits: Vec<JobSplit> }
+pub struct JobSplit { pub job_id: JobId, pub pieces: Vec<JobPiece> }   // an unstarted job re-cut at the window's edges
+pub struct JobPiece { pub id: JobId, pub range: SlotRange, pub end_kind: JobEndKind }
 
 // core/src/domain/price.rs
 pub enum PriceSource { Binance, Peg, CarriedForward }
@@ -1097,14 +1110,15 @@ impl GeyserStream<Subscribed>   { pub async fn next_block(&mut self) -> Result<F
 
 // core/src/ingest/rpc.rs
 pub enum RpcErrorClass { Retry, SkippedSlot, MissingInStorage, ConfigurationBug }
-pub struct RequestsPerSecondMax(u32);
+pub struct RpsMax(u32);
 pub struct TokenBucket { capacity: u32, refill_count_per_second: u32 }
 
 // core/src/store/ — write path pub(crate); read path pub
 pub(crate) async fn write_block(/* conn, EnrichedBlock, BlockOrigin */) -> Result<StoredBlock, StoreError>;   // covers (parent_slot, slot] in the block's transaction
 pub(super) async fn cover(/* tx, parent_slot: Slot, slot: Slot, block_time: UnixSeconds */) -> Result<(), StoreError>;
 pub(crate) async fn read_cursor(/* executor */) -> Result<Option<Cursor>, StoreError>;
-pub async fn reconcile(/* conn, floor: Option<Slot>, Option<ArchiveWindow> */) -> Result<ReconcileSummary, StoreError>;   // pub for core/tests/processor.rs
+pub async fn reconcile(/* conn, Option<ArchiveWindow> */) -> Result<ReconcileSummary, StoreError>;   // pub for core/tests/processor.rs
+pub async fn insert_backfill_job(/* executor, from_slot: Slot */) -> Result<BackfillInsert, StoreError>;   // pub for the API's POST /v1/backfills
 pub(crate) async fn read_open_jobs(/* pool, RowCountMax, JobSelection { All, InsideArchiveWindow, OutsideArchiveWindow } */) -> Result<Vec<SlotRangeJob>, StoreError>;   // ORDER BY end_slot DESC, route before LIMIT
 pub(crate) async fn block_job(/* pool, JobId, JobBlock */) -> Result<(), StoreError>;   // Unmappable(x) mid-job: end at x, reopen x+1..end in one transaction
 pub async fn read_swap_log_page(/* after: LogPosition, RowCountMax */) -> Result<Vec<InsertedSwap>, StoreError>;
@@ -1153,6 +1167,20 @@ Axum, JSON, UTC everywhere, base path `/v1`.
 | `GET /v1/pools?limit=50` | pools ordered by 24-hour volume from `pool_volume_1h`, for the CLI picker |
 | `GET /v1/pools/{pool}/volume?bucket=hour\|day&from=<rfc3339>&to=<rfc3339>` | the required endpoint |
 | `GET /v1/pools/{pool}/swaps?limit=20` | most recent swaps with signature, ordinal, amounts, fee raw, `fill_job_id` |
+| `POST /v1/backfills` with `{"from": "<rfc3339>"}` | inserts one backfill job (§2.5) and answers 202 `{ job_id, start_slot, end_slot }` |
+
+**Backfill**, the API's only write. Checks, in order: the body is JSON with an RFC 3339
+`from` (400 `invalid_backfill_body`); `from` is not in the future (400
+`backfill_from_in_future`); the API has `RPC_URL` (503 `backfill_unavailable`); something is
+indexed (409 `nothing_indexed_yet`); the bisection succeeds (502 `rpc_unavailable`) and lands
+below the lowest range (400 `backfill_from_after_coverage`); the insert does not overlap a job
+(409 `backfill_overlaps_job`). The cheap checks run before the bisection, which costs tens of
+RPC calls; the insert re-reads the lowest range itself, so they are early answers, not the
+guarantee. Writing here is acceptable because it writes a job row, never a swap: the
+processor stays the only writer of swaps, coverage and projections, the job is checked by the
+same exclusion constraint as the reconciler's, and the filler and reconciler cannot tell it
+from a hole's job. It needs no advisory lock. The API's RPC limiter is its own, so a backfill
+request adds its bisection to the indexer's load on the same key.
 
 **Validation for volume**, in order: `pool` parses as base58 and exists (404); `bucket`
 present; `from` and `to` parse as RFC 3339 (any offset, converted to UTC); `from` is
@@ -1222,7 +1250,7 @@ status and body on 1). Symlinked under `.claude/skills/` like the other skills.
 
 `docker-compose.yml`:
 
-- `db`: pinned `timescale/timescaledb:2.30.x-pg17`, named volume, `healthcheck:
+- `db`: `timescale/timescaledb:latest-pg17`, named volume, `healthcheck:
   pg_isready`, `TS_TUNE_MEMORY` set to the compose memory limit.
 - `indexer`: `depends_on: db: condition: service_healthy`; runs `sqlx migrate run` then the
   actors; `restart: unless-stopped`; `stop_grace_period: 30s`; healthcheck tests that
@@ -1232,12 +1260,14 @@ status and body on 1). Symlinked under `.claude/skills/` like the other skills.
   8080; `healthcheck: curl -f /v1/health`; `restart: unless-stopped`.
 - `metclanker` is not a service; the README runs it with `bun run` or the compiled binary.
 
-Environment (`.env.example` committed, `.env` ignored): `DATABASE_URL`,
-`DATABASE_URL_READONLY`, `API_READER_PASSWORD`, `RPC_URL`, `RPC_REQUESTS_PER_SECOND_MAX`,
-`RPC_TRANSACTION_VERSION_MAX` (default 1), `GEYSER_ENDPOINT` and `GEYSER_X_TOKEN`
-(optional; absent means RPC tail), `GEYSER_TRANSACTION_VERSION_MAX` (default 1),
-`PRICE_API_BASE_URL` (default `https://data-api.binance.vision`), `BACKFILL_FROM`
-(optional), `LOG_FORMAT`.
+Environment (`.env.example` committed, `.env` ignored): `DB_DSN`,
+`RPC_URL`, `RPC_RPS_MAX`, `TRANSACTION_VERSION_MAX` (default 1, both live sources and the
+filler), `GEYSER_URL` and `GEYSER_X_TOKEN` (optional; absent means RPC tail),
+`BINANCE_DATA_API_URL` (default `https://data-api.binance.vision`), `ARCHIVE_RPC_URL` and
+`ARCHIVE_RPS_MAX` (optional), `LOG_FORMAT`. `#[sqlx::test]` reads `DATABASE_URL` by name,
+so tests run as `DATABASE_URL="$DB_DSN" cargo test --workspace`. Backfill is not
+configured: it is a job the API inserts on `POST /v1/backfills` (§2.5); the API reads
+`RPC_URL` and `RPC_RPS_MAX` for it and answers 503 without `RPC_URL`.
 
 Logging: `tracing` JSON lines with `slot`, `signature`, `job_id`; one INFO `block_indexed`
 per block with swap and duplicate counts; one WARN per decode failure; counters through
@@ -1253,8 +1283,8 @@ per block with swap and duplicate counts; one WARN per decode failure; counters 
 4. `bun install && bun run metclanker pools` lists pools with volume in the last minutes.
 5. `bun run metclanker volume --pool <top pool> --range 24h --bucket hour --compare`
    renders the table and Meteora's figures beside it.
-6. Optional: set `GEYSER_ENDPOINT` and restart to switch the live source; set
-   `BACKFILL_FROM` on a fresh database to see a backfill job progress in `/v1/health`.
+6. Optional: set `GEYSER_URL` and restart to switch the live source; submit
+   `metclanker backfill --from <instant>` to see a backfill job progress in `/v1/health`.
 
 **Later, out of scope.** ECS Fargate: one `indexer` service (desired count 1) and one `api`
 service (count 2 behind an ALB); the database on Timescale Cloud or a self-managed instance
@@ -1294,10 +1324,12 @@ determinism.
 
 Coverage tests against the database: a fake chain with skipped slots, covered in a seeded
 random order, ends as one range with the last block's time, and covering every block again
-changes nothing; `reconcile` opens one job per unowned hole (between ranges and down to the
-floor) nearest the tip first, skips holes an open or blocked job owns, and completes a job
-coverage contains; a processor-level test drives a live jump, one reconcile, the fill and the
-completion; the exclusion constraint rejects an overlapping job.
+changes nothing; `reconcile` opens one job per unowned hole between ranges, nearest the tip
+first, skips holes an open or blocked job owns, and completes a job coverage contains;
+processor-level tests drive a live jump, one reconcile, the fill and the completion, and the
+same for a backfill job inserted below the lowest range; the backfill insert ends at the slot
+below the lowest range and refuses an empty coverage, a start at or above it, and an
+overlap; the exclusion constraint rejects an overlapping job.
 
 Pure tests: `verify_parent_chain` with a missing slot; `quote_leg` for the four allowlist cases;
 `align_range` at month and day boundaries and the cap order; `classify_rpc_error`;
@@ -1413,14 +1445,15 @@ carries per-projection cursors.
 | Offline projection rebuild | online rebuild with a position rule | zero new concurrency logic for the assignment; projections commute so online is a next step |
 | Store raw `Swap2Evt` bytes | decode now or discard | 147 bytes a row buys "decode later" as a rebuild instead of a re-index |
 | `governor` plus `backon` | `tower` limiter, `backoff`, `reqwest-retry` | GCRA with weighted permits; maintained; `Retry-After` and JSON-RPC body classification |
-| Gateways with a version ceiling each from the environment | one global constant | a new transaction version means a new mapper and a re-index, so the operator raises it per source |
+| One transaction version ceiling from the environment for every gateway (2026-10-05) | a ceiling per source; one global constant | a new transaction version means a new mapper and a re-index, and a version is supported across every source or not at all, so the operator raises it once, deliberately |
 | `encoding: json` for RPC blocks | `base64` | no Solana wire-format crates; 20 percent more bytes |
 | Store `fee_rate_1e9` | drop it | the task's fee semantics may need the rate; one `u64` column |
 | Base units only in the database | raw plus human-readable twins (ft-backend `_hmr`) | one source of truth; conversion at the API edge; decimals may be unknown at insert |
 | SQL domains for addresses, signatures and base amounts | plain TEXT and NUMERIC | invariants visible in the schema at no runtime cost (ft-backend's `uint256`, `eth_address`) |
 | Projections synchronous in the block transaction | async fold worker with its own checkpoint | strongly consistent, no lag to measure; the `projection` cursor table reserves the async path |
-| `price(asset, ts, source)`: latest eligible row in `(block_time - 60 s, block_time]`, source in the key (2026-10-05) | `price_minute` keyed by asset and minute with an exact-minute match | `ts` is when the price was observed, so the rule reads as "the last price known at `t`" and works for any source cadence; on the one-minute grid it equals the old rule; `source` in the key lets a second market sit beside the first behind `PRICE_SOURCE` |
+| `price(asset, ts, source)`: latest eligible row in `(block_time - 60 s, block_time]`, source in the key (2026-10-05) | `price_minute` keyed by asset and minute with an exact-minute match | `ts` is when the price was observed, so the rule reads as "the last price known at `t`" and works for any source cadence; on the one-minute grid it equals the old rule; `source` in the key lets a second market sit beside the first behind the market constant |
 | One `u64` SQL domain for every u64 column; the domain names the range, the column name the unit (2026-10-05) | `amount_base` and `fee_rate_1e9` domains | a domain is a value range, so two domains with one range were one domain twice; units already live in column names (`fee_rate_1e9`, base units of the fee token) |
+| Backfill is a job the API inserts; the reconciler has no floor (2026-10-05) | `BACKFILL_FROM` resolved on every boot into a reconciler floor; a request table the indexer resolves | the job is the backfill: one row, visible in SQL and `/v1/health`, submittable while running, refused on overlap by the constraint every job already has; the API writes a job row, never a swap |
 
 ADR: exactly one, for the pricing model (pre-priced USD column from a three-mint quote-leg
 allowlist at the last closed price at block time). It is hard to reverse (every row carries it),

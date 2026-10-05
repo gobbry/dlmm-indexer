@@ -1,6 +1,6 @@
 ---
 name: metclanker
-description: "Read the Meteora DLMM swap indexer's REST API with the metclanker CLI: indexer health and lag, pools ranked by 24-hour USD volume, hourly or daily volume per pool in tokens and USD, recent swaps, and a per-bucket comparison against Meteora's own Data API. Use when asked about indexed DLMM swap volume, a pool's hourly or daily volume, whether the indexer is healthy or lagging, recent swaps of a pool, or whether our numbers match Meteora's; also for producing JSON proof of an API response."
+description: "Read the Meteora DLMM swap indexer's REST API with the metclanker CLI: indexer health and lag, pools ranked by 24-hour USD volume, hourly or daily volume per pool in tokens and USD, recent swaps, a per-bucket comparison against Meteora's own Data API, and backfill requests. Use when asked about indexed DLMM swap volume, a pool's hourly or daily volume, whether the indexer is healthy or lagging, recent swaps of a pool, or whether our numbers match Meteora's; to index history from an earlier time (backfill); also for producing JSON proof of an API response."
 compatibility: "Requires Bun 1.3+ (run from cli/ with `bun run src/cli.ts`, or the compiled cli/dist/metclanker) and the indexer API at http://127.0.0.1:8080 (override with --base-url or METCLANKER_BASE_URL). --compare also needs network access to https://dlmm.datapi.meteora.ag."
 ---
 
@@ -22,6 +22,7 @@ cd cli && bun run src/cli.ts <command> [flags] --output json --no-input
 | `pools` | `--limit N` (default 50) | `GET /v1/pools?limit=N` |
 | `volume` | `--pool <base58>` `--bucket hour\|day` and either `--range 24h\|7d\|30d` or `--from <rfc3339> --to <rfc3339>`; `--compare` | `GET /v1/pools/{pool}/volume?bucket=&from=&to=` |
 | `swaps` | `--pool <base58>` `--limit N` (default 20) | `GET /v1/pools/{pool}/swaps?limit=N` |
+| `backfill` | `--from <rfc3339>` (not in the future) | `POST /v1/backfills` with `{"from": …}` |
 
 Global flags, accepted before or after the command:
 
@@ -54,13 +55,16 @@ Keys always appear in this order:
 }
 ```
 
-- `compare` is present only with `--compare`.
+- `compare` is present only with `--compare`. A `backfill` envelope's `request` also carries
+  `body`, the JSON sent.
 - `data`: `health` → the health object; `pools` → pool list; `volume` → the API's buckets
   (`start`, `swap_count`, `volume_x`, `volume_x_raw`, `volume_y`, `volume_y_raw`,
-  `volume_usd`, `unpriced_swap_count`); `swaps` → swap list.
+  `volume_usd`, `unpriced_swap_count`); `swaps` → swap list; `backfill` → the job the API
+  inserted (`job_id`, `start_slot`, `end_slot`).
 - `summary`: `volume` → `total_usd` (exact decimal string), `max_bucket`, `bucket_count`,
   `swap_count`, `unpriced_swap_count`, `bucket`, `from`, `to`; `pools` → `pool_count`,
-  `total_volume_usd_24h`; `swaps` → `pool`, `swap_count`; `health` → `status`, `lag_seconds`.
+  `total_volume_usd_24h`; `swaps` → `pool`, `swap_count`; `health` → `status`, `lag_seconds`;
+  `backfill` → `job_id`, `slot_count`.
 - Health `status`, first match wins: `starting` (no cursor yet), `lagging` (`lag_seconds >
   120`), `blocked` (`blocked_job_count > 0`: a slot range the node cannot serve; needs an
   operator), `backfilling` (`open_job_count > 0`: holes in coverage still being
@@ -116,13 +120,27 @@ bun run src/cli.ts volume --pool 5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6 --b
 Find a pool address first with `pools --limit 10 --output json --no-input` and read
 `data[].address`.
 
+Index history from an earlier time, then watch the job through `health` (`status` is
+`backfilling` and `open_job_count` counts it until it is filled):
+
+```sh
+bun run src/cli.ts backfill --from 2026-10-04T12:00:00Z --output json --no-input
+```
+
+The API resolves the instant to a slot over RPC before it answers, so `backfill` waits at
+least 120 s whatever `--timeout-ms` says. It answers 202 with the job, or a refusal: 400
+`invalid_backfill_body`, `backfill_from_in_future` or `backfill_from_after_coverage` (the
+instant is not older than what is indexed); 409 `nothing_indexed_yet` or
+`backfill_overlaps_job` (an earlier backfill owns part of the range); 502 `rpc_unavailable`;
+503 `backfill_unavailable` (the API runs without `RPC_URL`). Do not resubmit on 409.
+
 ## Failure handling
 
 - Exit 3: retry once with the same arguments. If it fails again, report that the API at
   `request.url` is unreachable or timed out (check `health`, `--base-url`, `--timeout-ms`).
 - Exit 1: do not retry. Report `error.status` and `error.body` verbatim; a 404 means the pool
   is unknown to the indexer, a 400 carries the validation code (for example
-  `invalid_range`).
+  `invalid_range`), a 409 from `backfill` names why no job was inserted.
 - Exit 2: fix the arguments using the table above; never re-run without `--no-input`.
 - `--compare` failures keep our `data` and put Meteora's failure in `compare.error` and
   `error`; the exit code follows the same table.

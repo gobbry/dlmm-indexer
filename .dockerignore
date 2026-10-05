@@ -1,0 +1,12 @@
+target
+cli
+docs
+show-me
+.git
+.agents
+.claude
+.env
+*.log
+task.pdf
+README.md
+DESIGN.md

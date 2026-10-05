@@ -1,0 +1,16 @@
+epoch: 1019
+version: 1
+data:
+  car:
+    uri: https://files.old-faithful.net/1019/epoch-1019.car
+indexes:
+  slot_to_cid:
+    uri: https://files.old-faithful.net/1019/epoch-1019-bafyreifwurdtpiy7qgxcnebkk72tuqcntier72ge65yutbzzupvbjq5c4i-mainnet-slot-to-cid.index
+  sig_to_cid:
+    uri: https://files.old-faithful.net/1019/epoch-1019-bafyreifwurdtpiy7qgxcnebkk72tuqcntier72ge65yutbzzupvbjq5c4i-mainnet-sig-to-cid.index
+  cid_to_offset_and_size:
+    uri: https://files.old-faithful.net/1019/epoch-1019-bafyreifwurdtpiy7qgxcnebkk72tuqcntier72ge65yutbzzupvbjq5c4i-mainnet-cid-to-offset-and-size.index
+  sig_exists:
+    uri: https://files.old-faithful.net/1019/epoch-1019-bafyreifwurdtpiy7qgxcnebkk72tuqcntier72ge65yutbzzupvbjq5c4i-mainnet-sig-exists.index
+  slot_to_blocktime:
+    uri: https://files.old-faithful.net/1019/epoch-1019-bafyreifwurdtpiy7qgxcnebkk72tuqcntier72ge65yutbzzupvbjq5c4i-mainnet-slot-to-blocktime.index

@@ -47,6 +47,9 @@ description: "Project Rust rules for this repo: functional core, Newtype and Typ
   (`signature` not `sig`, `transaction` not `tx`), units and qualifiers as
   suffixes (`timeout_ms`, `amount_lamports`, `retry_count`, `batch_size_max`),
   related names share a prefix so they sort together.
+- Configuration identifiers mirror their environment variable names (`db_dsn`,
+  `rpc_rps_max`, `RpsMax`), even where that abbreviates; everything else
+  follows TigerStyle.
 - Standard-library and trait-mandated names follow Rust (`len`, `iter`, `fmt`,
   `from_str`). Clippy's naming lints win over TigerStyle where they conflict.
 

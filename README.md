@@ -1,7 +1,7 @@
 # Meteora DLMM swap indexer
 
 Indexes every swap of Meteora's DLMM program on Solana mainnet, stores each one exactly
-once in TimescaleDB, and serves hourly and daily volume per pool, in tokens and USD, over a REST API. Three parts: **core** (Rust `indexer`: Geyser stream or RPC tail as the live source, a coverage reconciler and range filler, Binance price feed, one writer), **api** (Rust/Axum, read-only database role), and **cli** (`metclanker`, a Bun CLI that doubles as an agent skill in `.agents/skills/metclanker/`). The program indexed is `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`.
+once in TimescaleDB, and serves hourly and daily volume per pool, in tokens and USD, over a REST API. Three parts: **core** (Rust `indexer`: Geyser stream or RPC tail as the live source, a coverage reconciler and range filler, Binance price feed, one writer), **api** (Rust/Axum: reads, plus the one backfill job insert), and **cli** (`metclanker`, a Bun CLI that doubles as an agent skill in `.agents/skills/metclanker/`). The program indexed is `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`.
 
 Design and trade-offs: [DESIGN.md](DESIGN.md). Full design and build plan:
 [docs/plans/](docs/plans/).
@@ -19,7 +19,7 @@ Design and trade-offs: [DESIGN.md](DESIGN.md). Full design and build plan:
 
 ```bash
 cp .env.example .env
-# edit .env: set RPC_URL (and RPC_REQUESTS_PER_SECOND_MAX=4 if you use the public endpoint)
+# edit .env: set RPC_URL (and RPC_RPS_MAX=4 if you use the public endpoint)
 ```
 
 **2. Start**
@@ -108,6 +108,7 @@ binary in `cli/dist/metclanker`). Interactive prompts appear for missing flags o
 | `pools` | `--limit N` |
 | `volume` | `--pool <base58>` `--bucket hour\|day` `--range 24h\|7d\|30d` or `--from/--to <rfc3339>`, `--compare` |
 | `swaps` | `--pool <base58>` `--limit N` |
+| `backfill` | `--from <rfc3339>` (waits at least 120 s: the API resolves the slot over RPC first) |
 
 Global: `--base-url` (default `http://127.0.0.1:8080`), `--output table|json|raw`,
 `--no-input`, `--timeout-ms`, `--no-color`. `--output json` prints one JSON envelope
@@ -127,6 +128,7 @@ curl 'localhost:8080/v1/pools?limit=20'
 curl 'localhost:8080/v1/pools/<pool>/volume?bucket=hour&from=2026-10-02T00:00:00Z&to=2026-10-03T00:00:00Z'
 curl 'localhost:8080/v1/pools/<pool>/volume?bucket=day&from=2026-09-01T00:00:00Z&to=2026-10-01T00:00:00Z'
 curl 'localhost:8080/v1/pools/<pool>/swaps?limit=20'
+curl -X POST localhost:8080/v1/backfills -d '{"from":"2026-10-04T12:00:00Z"}'
 ```
 
 `from` is floored and `to` ceiled to the bucket and echoed back. Caps: 744 hourly or 366
@@ -146,11 +148,11 @@ for swaps without one. `source` says which path stored the row: `live_geyser`, `
 
 ## Live sources: Geyser and the RPC tail
 
-Without `GEYSER_ENDPOINT` the RPC tail is the live source (`live_source_rpc_tail` at
+Without `GEYSER_URL` the RPC tail is the live source (`live_source_rpc_tail` at
 startup): every 2 s it lists the blocks past the cursor with `getBlocks` and fetches only
 those with `getBlock`, the same two calls the range filler uses.
 
-With `GEYSER_ENDPOINT` (and `GEYSER_X_TOKEN` if the provider wants one) the indexer logs
+With `GEYSER_URL` (and `GEYSER_X_TOKEN` if the provider wants one) the indexer logs
 `live_source_geyser` and subscribes to a Yellowstone `blocks` stream at `finalized`,
 filtered to the DLMM program, resuming with `from_slot = cursor + 1`. Fallback and handback
 are automatic: when the stream fails or is silent for 30 s, the supervisor starts the RPC
@@ -164,38 +166,58 @@ Status: built and tested against an in-process Yellowstone server (serves blocks
 silent, the tail takes over within 30 s with a continuous cursor); **not yet verified
 against a live provider**, since no credential was available.
 
-## Backfill from a timestamp
+## Backfill: submit a job request
 
 ```bash
-# .env
-BACKFILL_FROM=2026-10-04T12:00:00Z
+curl -X POST localhost:8080/v1/backfills -d '{"from":"2026-10-04T12:00:00Z"}'
+# or
+cd cli && bun run metclanker backfill --from 2026-10-04T12:00:00Z
 ```
 
-On every boot the indexer bisects over `getBlocks` and `getBlockTime` to the first slot at
-or after that instant that holds a block (`coverage_floor_resolved`, with the slot), then
-starts the live source. That slot is the reconciler's floor: once the first live block has
-committed (and, with an archive configured, once its window is read), the next tick (every
-10 s) opens one `slot_range_job` from the floor up to the lowest `slot_coverage` range, and the filler works it alongside live ingestion; its rows
-carry `source = 'fill'` and the job's `fill_job_id`. A restart resolves the same floor and
-finds the job already open (or the range already covered), so nothing is opened twice.
-Progress:
+```json
+{"job_id":1,"start_slot":453473301,"end_slot":453473936}
+```
+
+The API checks the instant (RFC 3339, not in the future), bisects over `getBlocks` and
+`getBlockTime` to the first slot at or after it that holds a block, and inserts one
+`slot_range_job` from that slot up to the slot below the lowest `slot_coverage` range (the
+parent of that range's first block), answering 202 with the job. It needs `RPC_URL` (and
+reads `RPC_RPS_MAX`) in the API's environment; without it the endpoint answers 503
+`backfill_unavailable`. Refusals: 400 `invalid_backfill_body`, `backfill_from_in_future`, or
+`backfill_from_after_coverage` (nothing older than what is indexed); 409 `nothing_indexed_yet`
+(no live block has committed yet) or `backfill_overlaps_job` (another job owns part of that
+range; resubmitting the same instant is refused, never stored twice); 502 `rpc_unavailable`.
+The indexer keeps running: the filler picks the job up on its next scan (within 10 s) and
+works it alongside live ingestion, logging `fill_job_started` and `block_indexed` lines with
+`"origin":"fill"`; its rows carry `source = 'fill'` and the job's `fill_job_id`; once its
+blocks join the range above, the reconciler logs `coverage_reconciled` with
+`completed_job_count` and sets `completed_at`. Meanwhile `/v1/health` reports `backfilling`.
+A request older than a week is split at the week line on the next reconciler tick so the old
+part is served by the archive (logged as `backfill_job_split`). Progress:
 
 ```bash
 docker compose exec db psql -U postgres -d dlmm -c \
   "select id, start_slot, end_slot, next_slot, blocked_reason, completed_at from slot_range_job"
 docker compose exec db psql -U postgres -d dlmm -c \
-  "select source, count(*) from swap group by 1"
+  "select source, count(*), count(fill_job_id) from swap group by 1"
 ```
 
-Observed on 2026-10-04 (fresh database, public RPC at 4 requests per second, no Geyser):
-`BACKFILL_FROM` 15 s in the past resolved to slot 453149692, and the first `fill` row is in
-that very slot; job 1 ran from 453149692 to 453149791 (that run predates the reconciler, so
-the first live block opened it; today the first reconcile tick opens it). In
+Observed on 2026-10-05 (fresh database, public RPC at 4 requests per second for both the
+indexer and the API, no Geyser): six seconds after the indexer started, a request for three
+minutes earlier answered 202 in 5 s with job 1, slots 453473301 to 453473936 (636 slots,
+ending right below the first live range at 453473937); the same request again answered 409
+`backfill_overlaps_job`. The filler started the job 6 ms after the insert and, through the
+public endpoint's 429 pauses, covered 12 of its slots in two minutes with 50 `fill` rows,
+every one carrying `fill_job_id`, beside 160 `live_rpc` rows; no swap was stored twice. A day
+of history is about 320,000 blocks at the 0.27 s slots measured in October 2026; that needs
+a paid RPC tier, not a free one.
+
+Observed on 2026-10-04, before backfill was a job request (the floor was then resolved at
+boot from an environment variable): a floor 15 s in the past resolved to slot 453149692, and
+the first `fill` row is in that very slot; job 1 ran from 453149692 to 453149791. In
 7 minutes the filler covered 35 of its 100 slots (the public endpoint throttles hard), with
 128 `fill` rows, every one carrying `fill_job_id`, beside 453 `live_rpc` rows; no swap was
-stored twice and the fee identity below returned 0 over all 581 rows. A day of history is
-about 320,000 blocks at the 0.27 s slots measured in October 2026; that needs a paid RPC
-tier, not a free one.
+stored twice and the fee identity below returned 0 over all 581 rows.
 
 After the same run, with the indexer stopped, `rebuild-projection pool_volume_1d` replayed
 581 swaps in one page and reproduced all 155 `pool_volume_1d` rows exactly
@@ -242,13 +264,13 @@ retryable error (an epoch the server did not load) blocks after about twenty min
 an outage, which never blocks a job. See `archive/README.md` for the epochs served and how to add one.
 
 Observed on 2026-10-04 UTC (fresh database, public RPC at 4 requests per second through a
-counting proxy, archive with epochs 1043 to 1047): `BACKFILL_FROM` two minutes below the week
-line resolved to slot 451076871 (`coverage_floor_resolved`, 21 s into the boot, slowed by the
-public endpoint's 429s); live started then, and `archive_window_resolved` followed 19 s later
+counting proxy, archive with epochs 951 to 1047 (six months); backfill was then a floor set by an
+environment variable and resolved at boot): a floor two minutes below the week line resolved
+to slot 451076871 (21 s into the boot, slowed by the public endpoint's 429s); live started then, and `archive_window_resolved` followed 19 s later
 with `bottom` 450576000 and `top` 451077403. The first reconcile opened archive job 2 for
 451076871 to 451077403 (533 slots) and provider job 1 from 451077404 up to the live range.
 The run was stopped at its 12-minute limit with the archive job at slot 451077327 and
-restarted with the same `BACKFILL_FROM`; the restart resolved the same floor, opened nothing
+restarted with the same floor; the restart resolved the same slot, opened nothing
 for the covered range, resumed job 2 from the table, and the reconciler completed it 110 s
 later, merging it with the provider job's progress into one range from the floor. About 14
 minutes of archive fetching in all (533 slots in about 840 s, about 0.6 slots/s; skipped
@@ -278,11 +300,20 @@ is a hole in `slot_coverage`; the reconciler opens a job for it and the filler c
 
 ## Schema notes
 
-`migrations/0001_schema.sql` is the whole schema. Values are guarded by SQL domains:
+`migrations/0001_core.sql` holds the event log, prices, coverage and jobs;
+`migrations/0002_projections.sql` holds the projections, which are derived from the swap log
+and rebuildable from it. Both are edited in place rather than appended to, so a changed
+migration needs `docker compose down -v` before the next run. Values are guarded by SQL domains:
 `solana_address` and `solana_signature` (base58 text of the right length),
 `u64` (`NUMERIC(20,0)` within the `u64` range; the unit is in the column name, as in
-`fee_rate_1e9`). Enums cover direction, quote asset, fee side and token, source, price
-source and projection state.
+`fee_rate_1e9`), and `asset_symbol` (an upper-case ticker: `SOL`, `USDC`, `USDT`). Enums
+cover direction, fee side and token, source, price source and projection state.
+A quote asset is plain text in SQL (`price.asset_symbol`, `swap.quote_asset_symbol`, null for
+a pool with no quote asset), not an enum, so adding one needs no migration, only Rust: a
+`QuoteAsset` variant in `core/src/domain/amounts.rs` (ticker and decimals, the compiler then
+asks for its quote rank in `enrich.rs` and its Binance symbol in `gateway/binance.rs`) and
+its mint in `QuoteAllowlist`; the price feed iterates `QuoteAsset::ALL`. There are no SQL functions: the price lookup and the USD arithmetic are
+SQL fragments in `core/src/store/price.rs`, shared by the swap insert and the reprice sweep.
 `slot_coverage` holds the contiguous slot ranges fully indexed (an exclusion constraint
 keeps them disjoint); its top range's end is the cursor every live source resumes after.
 `slot_range_job` rows are derived from its holes and may not overlap either. A
@@ -306,7 +337,8 @@ docker compose exec db psql -U postgres -d dlmm -c \
 ```sh
 docker compose up -d db
 set -a; source .env; set +a
-cargo test --workspace          # decoder fixtures, idempotency and reprice against the db, API smoke
+# #[sqlx::test] reads DATABASE_URL by name, so hand it the DSN under that name
+DATABASE_URL="$DB_DSN" cargo test --workspace   # decoder fixtures, idempotency and reprice against the db, API smoke
 ARCHIVE_RPC_URL=http://127.0.0.1:8899 cargo test -p dlmm_core --test archive -- --include-ignored   # with ./archive/run.sh up
 cargo clippy --all-targets -- -D warnings && cargo fmt --check
 cd cli && bun test
@@ -321,27 +353,23 @@ nesting, and a failed transaction that still carries a `Swap` event).
 
 ## Configuration
 
-Set in `.env`; compose overrides the two database URLs and `API_LISTEN_ADDRESS` inside the
-containers.
+Set in `.env`; compose sets `DB_DSN` and `API_LISTEN_ADDRESS` inside the containers. The
+price market is not configured: it is `PriceSource::Binance` in code (configurable sources
+were misconfigurable; onboarding a market is a code change). Backfill is not configured
+either: it is a `POST /v1/backfills` request (above).
 
 | variable | default | meaning |
 |---|---|---|
-| `RPC_URL` | required | Solana mainnet RPC endpoint |
-| `RPC_REQUESTS_PER_SECOND_MAX` | `10` | client-side limit, 60 percent of it for live blocks; minimum 2, practical minimum 7 (the tail needs 5 a second at the 0.27 s slots measured in October 2026; 10 for Helius free is fine); 4 on the public endpoint is a lagging demo |
-| `RPC_TRANSACTION_VERSION_MAX` | `1` | `maxSupportedTransactionVersion`; raise only with a mapper for the new version |
-| `POSTGRES_PASSWORD` | `postgres` | superuser password of the `db` service |
-| `DATABASE_URL` | localhost | read-write URL (indexer, `cargo test`) |
-| `DATABASE_URL_READONLY` | localhost | read-only URL for the API as `api_reader`; falls back to `DATABASE_URL` |
-| `API_READER_PASSWORD` | `api_reader` | password of the `api_reader` role, created on first db start |
+| `DB_DSN` | localhost | database DSN for the indexer and the API (tests read it as `DATABASE_URL`, see Tests); the API only reads, except the backfill job insert, so a read-only role serves every read and refuses backfills |
+| `RPC_URL` | required by the indexer | Solana mainnet RPC endpoint; the API uses it only for `POST /v1/backfills` (503 `backfill_unavailable` without it) |
+| `RPC_RPS_MAX` | `10` | client-side limit, 60 percent of it for live blocks; minimum 2, practical minimum 7 (the tail needs 5 a second at the 0.27 s slots measured in October 2026; 10 for Helius free is fine); 4 on the public endpoint is a lagging demo |
+| `TRANSACTION_VERSION_MAX` | `1` | highest transaction version accepted, one ceiling for every source: RPC's `maxSupportedTransactionVersion`, enforced by the Geyser mapper (a block above it stops the indexer); raise only with mappers for the new version |
 | `API_LISTEN_ADDRESS` | `0.0.0.0:8080` | socket address the API binds to |
-| `PRICE_API_BASE_URL` | `https://data-api.binance.vision` | Binance market-data host (`api.binance.com` returns 451 to US egress) |
-| `PRICE_SOURCE` | `binance` | market price source a swap is priced from (a `price_source` value; only `binance` today); the feed's own `peg` and `carried_forward` rows stay eligible |
-| `GEYSER_ENDPOINT` | unset | Yellowstone gRPC endpoint (`http://` or `https://`); when set, Geyser is the primary live source and the RPC tail the automatic fallback |
+| `BINANCE_DATA_API_URL` | `https://data-api.binance.vision` | Binance market-data host (`api.binance.com` returns 451 to US egress) |
+| `GEYSER_URL` | unset | Yellowstone gRPC endpoint (`http://` or `https://`); when set, Geyser is the primary live source and the RPC tail the automatic fallback |
 | `GEYSER_X_TOKEN` | unset | sent as the `x-token` header; leave empty for providers that authenticate by URL or IP |
-| `GEYSER_TRANSACTION_VERSION_MAX` | `1` | highest transaction version the Geyser mapper accepts; a block above it stops the indexer |
-| `BACKFILL_FROM` | unset | RFC 3339 instant; the reconciler's floor: history from that time up to the lowest indexed range is filled |
 | `ARCHIVE_RPC_URL` | unset | Old Faithful `faithful-cli rpc` endpoint (`archive/run.sh`); holes at least a week old (by block time) that it serves are filled from it instead of `RPC_URL` |
-| `ARCHIVE_REQUESTS_PER_SECOND_MAX` | `20` | client-side limit for the archive; minimum 2. Latency, not this, paces it: 12 blocks in flight |
+| `ARCHIVE_RPS_MAX` | `20` | client-side limit for the archive; minimum 2. Latency, not this, paces it: 12 blocks in flight |
 | `LOG_FORMAT` | `json` | `json` or `pretty` |
 | `RUST_LOG` | `info` | tracing filter |
 
@@ -352,8 +380,7 @@ core/            dlmm_core: indexer binary (decode, enrich, projection, store, g
   tests/fixtures/  real mainnet getTransaction JSON
 api/             dlmm_api: Axum API binary
 cli/             metclanker (Bun + TypeScript)
-migrations/      0001_schema.sql (TimescaleDB, SQL domains, projections)
-docker/db-init/  creates the api_reader role
+migrations/      0001_core.sql (TimescaleDB, SQL domains), 0002_projections.sql
 archive/         Old Faithful epoch configs and run.sh for the deep-history archive
 .agents/skills/  agent skills, including metclanker
 docs/plans/      system design and implementation plan
