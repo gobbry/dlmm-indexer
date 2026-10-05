@@ -25,6 +25,13 @@ description: "Project Rust rules for this repo: functional core, Newtype and Typ
 - **Enums instead of booleans** for parameters and flags.
 - **Immutability by default.** `mut` is a signal to look twice.
 
+## Dependencies
+
+- **No `solana-*` crates.** Pubkeys are `[u8; 32]` behind newtypes, base58 via `bs58`,
+  events are parsed by hand from their fixed layouts, RPC JSON goes into our own `serde`
+  structs. The rule covers direct dependencies only: `yellowstone-grpc-proto` pulls
+  `solana-pubkey` transitively, and that is accepted.
+
 ## Assertions
 
 - Preconditions, postconditions, and invariants use `debug_assert!`,

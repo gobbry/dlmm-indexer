@@ -63,7 +63,7 @@ Keys always appear in this order:
   `total_volume_usd_24h`; `swaps` → `pool`, `swap_count`; `health` → `status`, `lag_seconds`.
 - Health `status`, first match wins: `starting` (no cursor yet), `lagging` (`lag_seconds >
   120`), `blocked` (`blocked_job_count > 0`: a slot range the node cannot serve; needs an
-  operator), `backfilling` (`open_job_count > 0`: gap or backfill ranges still being
+  operator), `backfilling` (`open_job_count > 0`: holes in coverage still being
   filled, so recent buckets may be incomplete), else `ok`.
 - With `--compare` each bucket also carries `meteora_volume_usd` (number), `difference_usd`
   (ours minus Meteora's, rounded to cents, `null` unless `compared`) and `comparison`:

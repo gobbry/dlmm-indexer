@@ -6,3 +6,7 @@
 *.log
 node_modules/
 cli/dist/
+archive/bin/
+
+# Implementation plans are working documents; they are not committed once the work is done.
+docs/plans/*-implementation-plan.md

@@ -12,7 +12,7 @@ Three services:
 
 ## Key references
 
-DLMM program ID: `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo` (verified executable on mainnet; the ID printed in `task.pdf`, ending `Pd8ZqK3m`, has no account).
+DLMM program ID: `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`.
 
 IDL and reference SDK: https://github.com/MeteoraAg/dlmm-sdk
 

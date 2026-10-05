@@ -11,7 +11,7 @@
       "source": "local",
       "sourceType": "local",
       "skillPath": ".agents/skills/rust-conventions/SKILL.md",
-      "computedHash": "3efb170e87c4ef7e3e3719e19f8fe7bd5dac3caab1fd77869f8d4ac4fc7d1ffc"
+      "computedHash": "5b319cf768792f30a87b8e9774b531ee3f38d61b0e3237b321f3548e9df9c066"
     },
     "test-audit": {
       "source": "openclaw/openclaw",
@@ -56,7 +56,7 @@
       "source": "local",
       "sourceType": "local",
       "skillPath": ".agents/skills/metclanker/SKILL.md",
-      "computedHash": "a665c47509d2c534057b0d1e9425a2eefc3aad2094b36a23d297dbefe5485ae1"
+      "computedHash": "3bb39f00990c09354e827e5f90f55bd45b140500eb7dd93d53b3e56b6bea7f32"
     }
   }
 }
