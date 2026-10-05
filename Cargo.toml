@@ -22,6 +22,8 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "g
 rust_decimal = "1.43.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# Dev-only: proves the discriminator constants against their Anchor names.
+sha2 = "0.10.9"
 sqlx = { version = "0.9.0", default-features = false, features = [
     "postgres",
     "runtime-tokio",

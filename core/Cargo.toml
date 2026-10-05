@@ -1,0 +1,43 @@
+[package]
+name = "dlmm_core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "indexer"
+path = "src/main.rs"
+
+[dependencies]
+backon.workspace = true
+base64.workspace = true
+bs58.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+governor.workspace = true
+reqwest.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+yellowstone-grpc-client.workspace = true
+yellowstone-grpc-proto.workspace = true
+tonic.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+# The in-process Geyser server in the source tests.
+tonic = { workspace = true, features = ["server"] }
+# Paused time for the stall and reconnect tests.
+tokio = { workspace = true, features = ["test-util"] }
+# Derives the Anchor discriminators from their names in a test.
+sha2.workspace = true
