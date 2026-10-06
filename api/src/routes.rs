@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::http::header::{CONTENT_TYPE, HeaderName};
+use axum::http::{Method, StatusCode};
+use axum::routing::{MethodRouter, delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use dlmm_core::domain::ids::{JobId, PoolAddress, UnixSeconds};
@@ -27,6 +28,7 @@ use crate::render::{
     render_pool_page, render_swap_page, render_volume,
 };
 
+const OPENAPI_DOCUMENT: &str = include_str!("../openapi.json");
 const JOB_LIST_COUNT_MAX: RowCountMax = RowCountMax::new(50);
 
 #[derive(Clone)]
@@ -60,23 +62,99 @@ struct BackfillRequest {
     from: String,
 }
 
+// The one list of what the API serves: the router is built from it and only from it, and
+// api/openapi.json is checked against it, so a route cannot ship without its contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    Health,
+    PoolList,
+    Pool,
+    PoolVolume,
+    PoolSwaps,
+    BackfillCreate,
+    BackfillList,
+    BackfillRead,
+    BackfillCancel,
+    OpenApi,
+}
+
+pub const ROUTES: [Route; 10] = [
+    Route::Health,
+    Route::PoolList,
+    Route::Pool,
+    Route::PoolVolume,
+    Route::PoolSwaps,
+    Route::BackfillCreate,
+    Route::BackfillList,
+    Route::BackfillRead,
+    Route::BackfillCancel,
+    Route::OpenApi,
+];
+
+impl Route {
+    pub const fn method(self) -> Method {
+        match self {
+            Self::BackfillCreate => Method::POST,
+            Self::BackfillCancel => Method::DELETE,
+            Self::Health
+            | Self::PoolList
+            | Self::Pool
+            | Self::PoolVolume
+            | Self::PoolSwaps
+            | Self::BackfillList
+            | Self::BackfillRead
+            | Self::OpenApi => Method::GET,
+        }
+    }
+
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::Health => "/v1/health",
+            Self::PoolList => "/v1/pools",
+            Self::Pool => "/v1/pools/{pool}",
+            Self::PoolVolume => "/v1/pools/{pool}/volume",
+            Self::PoolSwaps => "/v1/pools/{pool}/swaps",
+            Self::BackfillCreate | Self::BackfillList => "/v1/backfills",
+            Self::BackfillRead | Self::BackfillCancel => "/v1/backfills/{job_id}",
+            Self::OpenApi => "/openapi.json",
+        }
+    }
+
+    fn handler(self) -> MethodRouter<ApiState> {
+        let handler = match self {
+            Self::Health => get(health),
+            Self::PoolList => get(pools),
+            Self::Pool => get(pool_summary),
+            Self::PoolVolume => get(volume),
+            Self::PoolSwaps => get(swaps),
+            Self::BackfillCreate => post(backfill),
+            Self::BackfillList => get(backfills),
+            Self::BackfillRead => get(backfill_job),
+            Self::BackfillCancel => delete(cancel_backfill),
+            Self::OpenApi => get(openapi),
+        };
+        debug_assert!(self.path().starts_with('/'));
+        handler
+    }
+}
+
+// axum merges two routes on one path and panics on a repeated method, so a duplicate entry in
+// ROUTES fails at startup.
 pub fn router(database: PgPool, backfill_gateway: Option<Arc<RpcGateway>>) -> Router {
-    Router::new()
-        .route("/v1/health", get(health))
-        .route("/v1/pools", get(pools))
-        .route("/v1/pools/{pool}", get(pool_summary))
-        .route("/v1/pools/{pool}/volume", get(volume))
-        .route("/v1/pools/{pool}/swaps", get(swaps))
-        .route("/v1/backfills", post(backfill).get(backfills))
-        .route(
-            "/v1/backfills/{job_id}",
-            get(backfill_job).delete(cancel_backfill),
-        )
+    ROUTES
+        .into_iter()
+        .fold(Router::new(), |router, route| {
+            router.route(route.path(), route.handler())
+        })
         .fallback(not_found)
         .with_state(ApiState {
             database,
             backfill_gateway,
         })
+}
+
+async fn openapi() -> ([(HeaderName, &'static str); 1], &'static str) {
+    ([(CONTENT_TYPE, "application/json")], OPENAPI_DOCUMENT)
 }
 
 async fn not_found() -> ApiError {

@@ -10,6 +10,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
          --output /usr/local/bin/faithful-cli \
          "https://github.com/rpcpool/yellowstone-faithful/releases/download/${FAITHFUL_VERSION}/faithful-cli_linux_amd64" \
     && chmod +x /usr/local/bin/faithful-cli
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 EXPOSE 8899
-# Two epochs at a time: files.old-faithful.net rate-limits a burst of index requests.
-ENTRYPOINT ["faithful-cli", "rpc", "--listen", ":8899", "--epoch-load-concurrency", "2", "/epochs"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

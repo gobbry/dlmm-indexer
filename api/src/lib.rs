@@ -5,4 +5,4 @@ mod routes;
 
 pub use error::ApiError;
 pub use range::{RangeError, align_range};
-pub use routes::router;
+pub use routes::{ROUTES, Route, router};

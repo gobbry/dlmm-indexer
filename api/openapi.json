@@ -1,0 +1,1527 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Meteora DLMM swap indexer API",
+    "version": "0.1.0",
+    "description": "Read-only REST API over indexed Meteora DLMM swaps, except `POST /v1/backfills` and `DELETE /v1/backfills/{job_id}`, which request and cancel history fills. Times are UTC RFC 3339, and token amounts are strings in raw base units and in human units so that no precision is lost."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080"
+    }
+  ],
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Indexer health and lag.",
+        "description": "Reads the indexed tip, the job counts and the projections being rebuilt, and derives `status`.",
+        "responses": {
+          "200": {
+            "description": "Indexer health.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/pools": {
+      "get": {
+        "operationId": "listPools",
+        "summary": "Pools ranked by 24-hour USD volume.",
+        "description": "Offset pages over every indexed pool, ordered by `volume_usd_24h` descending (a pool without priced volume counts as 0), then `swap_count_24h` descending, then address. The ranking moves as blocks land, so a pool can cross a page boundary between two requests. An offset past the end gives an empty page with the same `page.total`.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size, 1 to 100. Canonical decimal only: no sign, no leading zero, no spaces.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "description": "Number of ranked pools to skip. Canonical decimal only.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of pools.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PoolList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Codes: `invalid_query`: The query string cannot be parsed. `invalid_limit`: `limit` is not a canonical decimal integer from 1 to 100. `invalid_offset`: `offset` is not a canonical non-negative decimal integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `projection_rebuilding`: The pool ranking reads `pool_stats` and `pool_volume_1h`; either one mid-rebuild gives 503. `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/pools/{pool}": {
+      "get": {
+        "operationId": "getPool",
+        "summary": "One pool's summary.",
+        "description": "The same object as an entry of `GET /v1/pools`.",
+        "parameters": [
+          {
+            "name": "pool",
+            "in": "path",
+            "required": true,
+            "description": "Pool (DLMM `lb_pair`) address, base58.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The pool summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Pool"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Codes: `invalid_pool`: The `pool` path segment is not a base58 32-byte address.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found. Codes: `pool_not_found`: The pool is well formed but the indexer has never seen it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `projection_rebuilding`: The summary reads `pool_stats` and `pool_volume_1h`; either one mid-rebuild gives 503. An unknown pool is still 404. `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/pools/{pool}/volume": {
+      "get": {
+        "operationId": "getPoolVolume",
+        "summary": "Hourly or daily volume of one pool.",
+        "description": "The API floors `from` and ceils `to` to UTC bucket boundaries (top of the hour, or UTC midnight) and echoes the aligned window. Every bucket in the window is present, oldest first; a bucket without swaps has zero volumes and a null `volume_usd`. At most 744 hourly or 366 daily buckets per request. Validation order: pool, existence, bucket, from, to, alignment, cap.",
+        "parameters": [
+          {
+            "name": "pool",
+            "in": "path",
+            "required": true,
+            "description": "Pool (DLMM `lb_pair`) address, base58.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": true,
+            "description": "Bucket size.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "hour",
+                "day"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "description": "Start instant, RFC 3339 with any offset (encode `+` as `%2B`). Floored to the bucket.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": true,
+            "description": "End instant, RFC 3339 with any offset. Ceiled to the bucket; the aligned end is exclusive.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The pool's buckets over the aligned window.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Volume"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Codes: `invalid_pool`: The `pool` path segment is not a base58 32-byte address. `invalid_query`: The query string cannot be parsed. `invalid_bucket`: `bucket` is missing or is not `hour` or `day`. `invalid_time`: `from` or `to` is missing or is not an RFC 3339 timestamp. The message names the parameter. `invalid_range`: `from` is not before `to` after alignment to the bucket. `range_too_large`: The aligned range holds more than 744 hourly or 366 daily buckets. The message gives the count and the cap.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found. Codes: `pool_not_found`: The pool is well formed but the indexer has never seen it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `projection_rebuilding`: `bucket=hour` reads `pool_volume_1h` and `bucket=day` reads `pool_volume_1d`; only the table of the requested bucket gives 503. `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/pools/{pool}/swaps": {
+      "get": {
+        "operationId": "listPoolSwaps",
+        "summary": "One pool's swaps, newest first.",
+        "description": "Keyset pages, newest first by block time and log position. Swaps that land while a client pages never shift or repeat a page. Served from the swap log, so a projection rebuild never gives 503 here.",
+        "parameters": [
+          {
+            "name": "pool",
+            "in": "path",
+            "required": true,
+            "description": "Pool (DLMM `lb_pair`) address, base58.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size, 1 to 100. Canonical decimal only: no sign, no leading zero, no spaces.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor: the `page.next_cursor` of the previous page. Omit it for the newest page. Clients must not build or edit it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of swaps.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwapList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Codes: `invalid_pool`: The `pool` path segment is not a base58 32-byte address. `invalid_query`: The query string cannot be parsed. `invalid_limit`: `limit` is not a canonical decimal integer from 1 to 100. `invalid_cursor`: `before` is not a `next_cursor` that this API issued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found. Codes: `pool_not_found`: The pool is well formed but the indexer has never seen it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/backfills": {
+      "post": {
+        "operationId": "createBackfill",
+        "summary": "Request a backfill of history from an instant.",
+        "description": "Resolves `from` to the first slot at or after it over RPC (tens of RPC calls; allow 120 s), then inserts one job from that slot up to the slot below the oldest indexed slot. The body is read as JSON whatever the `Content-Type`. The indexer splits a job older than one week at the week line; the returned `job_id` stays on the newest piece.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackfillRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The job was inserted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Codes: `invalid_backfill_body`: The body is not JSON with a `from` string that is an RFC 3339 timestamp. `backfill_from_in_future`: `from` is later than now. A backfill fills history only. `backfill_from_after_coverage`: `from` resolves to a slot at or above the oldest indexed slot, so there is nothing to fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict. Codes: `nothing_indexed_yet`: No block is indexed yet, so there is no indexed range for a backfill to end below. `backfill_overlaps_job`: Another job already owns part of the requested range. Do not resubmit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Bad gateway. Codes: `rpc_unavailable`: The RPC endpoint failed while the API resolved `from` to a slot. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `backfill_unavailable`: The API was started without `RPC_URL`, so it cannot resolve `from` to a slot. `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "listBackfills",
+        "summary": "The 50 newest jobs.",
+        "description": "Every fill job, whether a backfill request or a hole that the reconciler opened, newest first by creation time, at most 50.",
+        "responses": {
+          "200": {
+            "description": "The job list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillJobList"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/backfills/{job_id}": {
+      "get": {
+        "operationId": "getBackfill",
+        "summary": "One job.",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "Job id, a positive integer.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Codes: `invalid_job_id`: The `job_id` path segment is not a positive integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found. Codes: `job_not_found`: No job has that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "cancelBackfill",
+        "summary": "Cancel an open job.",
+        "description": "Blocks the job with reason `cancelled` instead of deleting it, so the reconciler does not reopen its range. From then on, health reports `blocked`. Only an operator can resume it.",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "Job id, a positive integer.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The cancelled job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillCancel"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Codes: `invalid_job_id`: The `job_id` path segment is not a positive integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found. Codes: `job_not_found`: No job has that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict. Codes: `job_already_completed`: The job is completed, so there is nothing to cancel. `job_already_blocked`: The job is already blocked (cancelled jobs included). The message names the existing reason.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error. Codes: `internal`: An unexpected server fault. The server log has the cause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service unavailable. Codes: `database_unavailable`: The database did not answer. Retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenApi",
+        "summary": "This OpenAPI document.",
+        "description": "Returns the OpenAPI 3.1 document that the binary embeds, as `application/json`.",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorEnvelope": {
+        "type": "object",
+        "description": "Every non-2xx response with a body.",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "The error.",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable detail. Not stable; match on `code`."
+          }
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "Stable machine-readable error code. `invalid_pool` (400): The `pool` path segment is not a base58 32-byte address. `pool_not_found` (404): The pool is well formed but the indexer has never seen it. `invalid_query` (400): The query string cannot be parsed. `invalid_bucket` (400): `bucket` is missing or is not `hour` or `day`. `invalid_time` (400): `from` or `to` is missing or is not an RFC 3339 timestamp. The message names the parameter. `invalid_range` (400): `from` is not before `to` after alignment to the bucket. `range_too_large` (400): The aligned range holds more than 744 hourly or 366 daily buckets. The message gives the count and the cap. `invalid_limit` (400): `limit` is not a canonical decimal integer from 1 to 100. `invalid_offset` (400): `offset` is not a canonical non-negative decimal integer. `invalid_cursor` (400): `before` is not a `next_cursor` that this API issued. `not_found` (404): No route matches the path. `database_unavailable` (503): The database did not answer. Retry later. `projection_rebuilding` (503): A projection table that the request reads from is being rebuilt offline and holds only part of the log. The message names the table. Retry after the rebuild; `GET /v1/health` lists the tables in `rebuilding`. `invalid_backfill_body` (400): The body is not JSON with a `from` string that is an RFC 3339 timestamp. `backfill_from_in_future` (400): `from` is later than now. A backfill fills history only. `backfill_from_after_coverage` (400): `from` resolves to a slot at or above the oldest indexed slot, so there is nothing to fill. `nothing_indexed_yet` (409): No block is indexed yet, so there is no indexed range for a backfill to end below. `backfill_overlaps_job` (409): Another job already owns part of the requested range. Do not resubmit. `invalid_job_id` (400): The `job_id` path segment is not a positive integer. `job_not_found` (404): No job has that id. `job_already_completed` (409): The job is completed, so there is nothing to cancel. `job_already_blocked` (409): The job is already blocked (cancelled jobs included). The message names the existing reason. `backfill_unavailable` (503): The API was started without `RPC_URL`, so it cannot resolve `from` to a slot. `rpc_unavailable` (502): The RPC endpoint failed while the API resolved `from` to a slot. Retry later. `internal` (500): An unexpected server fault. The server log has the cause.",
+        "enum": [
+          "invalid_pool",
+          "pool_not_found",
+          "invalid_query",
+          "invalid_bucket",
+          "invalid_time",
+          "invalid_range",
+          "range_too_large",
+          "invalid_limit",
+          "invalid_offset",
+          "invalid_cursor",
+          "not_found",
+          "database_unavailable",
+          "projection_rebuilding",
+          "invalid_backfill_body",
+          "backfill_from_in_future",
+          "backfill_from_after_coverage",
+          "nothing_indexed_yet",
+          "backfill_overlaps_job",
+          "invalid_job_id",
+          "job_not_found",
+          "job_already_completed",
+          "job_already_blocked",
+          "backfill_unavailable",
+          "rpc_unavailable",
+          "internal"
+        ]
+      },
+      "HealthStatus": {
+        "type": "string",
+        "description": "Derived indexer status; the first match in this order wins. `starting`: The indexer has not committed a block yet (`cursor_slot` is null). `lagging`: `lag_seconds` is more than 120: the newest indexed block is old. `blocked`: `blocked_job_count` is more than 0: a fill job waits on an operator. Cancelled backfills count here. `backfilling`: `open_job_count` is more than 0: holes in coverage are still being filled, so recent buckets can be incomplete. `ok`: No other status applies.",
+        "enum": [
+          "starting",
+          "lagging",
+          "blocked",
+          "backfilling",
+          "ok"
+        ]
+      },
+      "Health": {
+        "type": "object",
+        "description": "Indexer health.",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "cursor_slot",
+          "last_block_time",
+          "lag_seconds",
+          "open_job_count",
+          "blocked_job_count"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus"
+          },
+          "cursor_slot": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Highest indexed slot: the end of the top coverage range. Null until the first block commits.",
+            "minimum": 0
+          },
+          "last_block_time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. Block time at `cursor_slot`. Null until the first block commits."
+          },
+          "lag_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Seconds from `last_block_time` to now, never negative. Null when `last_block_time` is null.",
+            "minimum": 0
+          },
+          "open_job_count": {
+            "type": "integer",
+            "description": "Fill jobs still to walk: not completed, not blocked.",
+            "minimum": 0
+          },
+          "blocked_job_count": {
+            "type": "integer",
+            "description": "Jobs that wait on an operator: not completed, with a blocked reason (cancelled jobs included).",
+            "minimum": 0
+          },
+          "rebuilding": {
+            "type": "array",
+            "description": "Projection tables that an offline rebuild holds, in name order. Routes that read them answer 503 `projection_rebuilding`. Omitted when no table is rebuilding.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "pool_stats",
+                "pool_volume_1d",
+                "pool_volume_1h"
+              ]
+            }
+          }
+        }
+      },
+      "Pool": {
+        "type": "object",
+        "description": "One pool's summary. The 24-hour window is the current UTC hour and the 23 hours before it.",
+        "additionalProperties": false,
+        "required": [
+          "address",
+          "mint_x",
+          "mint_y",
+          "decimals_x",
+          "decimals_y",
+          "swap_count_24h",
+          "volume_usd_24h",
+          "first_swap_at",
+          "last_swap_at"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Pool (DLMM `lb_pair`) address."
+          },
+          "mint_x": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Mint of the pool's token X."
+          },
+          "mint_y": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Mint of the pool's token Y."
+          },
+          "decimals_x": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Decimals of token X. Null until the indexer fetched the mint.",
+            "minimum": 0
+          },
+          "decimals_y": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Decimals of token Y. Null until the indexer fetched the mint.",
+            "minimum": 0
+          },
+          "swap_count_24h": {
+            "type": "integer",
+            "description": "Swaps in the 24-hour window.",
+            "minimum": 0
+          },
+          "volume_usd_24h": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+(\\.[0-9]+)?$",
+            "description": "Exact decimal string, no exponent, trailing zeros removed. USD volume of the priced swaps in the 24-hour window. Null when the window holds no priced swap (no swaps, or every swap unpriced)."
+          },
+          "first_swap_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. Block time of the pool's first indexed swap. Null before the first swap."
+          },
+          "last_swap_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. Block time of the pool's last indexed swap. Null before the first swap."
+          }
+        }
+      },
+      "OffsetPage": {
+        "type": "object",
+        "description": "Offset paging state.",
+        "additionalProperties": false,
+        "required": [
+          "limit",
+          "offset",
+          "total"
+        ],
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "The page size that applied.",
+            "minimum": 1
+          },
+          "offset": {
+            "type": "integer",
+            "description": "The offset that applied.",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "description": "Every indexed pool, read in the same statement as the page.",
+            "minimum": 0
+          }
+        }
+      },
+      "PoolList": {
+        "type": "object",
+        "description": "One page of ranked pools.",
+        "additionalProperties": false,
+        "required": [
+          "pools",
+          "page"
+        ],
+        "properties": {
+          "pools": {
+            "type": "array",
+            "description": "Pools in rank order. Empty past the end.",
+            "items": {
+              "$ref": "#/components/schemas/Pool"
+            }
+          },
+          "page": {
+            "$ref": "#/components/schemas/OffsetPage"
+          }
+        }
+      },
+      "VolumeBucket": {
+        "type": "object",
+        "description": "One bucket, `[start, start + bucket)`.",
+        "additionalProperties": false,
+        "required": [
+          "start",
+          "swap_count",
+          "volume_x",
+          "volume_x_raw",
+          "volume_y",
+          "volume_y_raw",
+          "volume_usd",
+          "unpriced_swap_count"
+        ],
+        "properties": {
+          "start": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. Bucket start: top of the hour or UTC midnight."
+          },
+          "swap_count": {
+            "type": "integer",
+            "description": "Swaps in the bucket.",
+            "minimum": 0
+          },
+          "volume_x": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+(\\.[0-9]+)?$",
+            "description": "Exact decimal string, no exponent, trailing zeros removed. Token X volume in human units (raw divided by 10^decimals_x). Null when `decimals_x` is unknown."
+          },
+          "volume_x_raw": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Token X volume. A string because sums exceed 64 bits."
+          },
+          "volume_y": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+(\\.[0-9]+)?$",
+            "description": "Exact decimal string, no exponent, trailing zeros removed. Token Y volume in human units. Null when `decimals_y` is unknown."
+          },
+          "volume_y_raw": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Token Y volume."
+          },
+          "volume_usd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+(\\.[0-9]+)?$",
+            "description": "Exact decimal string, no exponent, trailing zeros removed. USD volume of the bucket's priced swaps. Null when the bucket is empty or every swap in it is unpriced. When `unpriced_swap_count` > 0 it is a lower bound."
+          },
+          "unpriced_swap_count": {
+            "type": "integer",
+            "description": "Swaps in the bucket without a USD value. Never more than `swap_count`.",
+            "minimum": 0
+          }
+        }
+      },
+      "Volume": {
+        "type": "object",
+        "description": "A pool's buckets over the aligned window.",
+        "additionalProperties": false,
+        "required": [
+          "pool",
+          "mint_x",
+          "mint_y",
+          "decimals_x",
+          "decimals_y",
+          "first_swap_at",
+          "bucket",
+          "from",
+          "to",
+          "buckets"
+        ],
+        "properties": {
+          "pool": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Pool address."
+          },
+          "mint_x": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Mint of token X."
+          },
+          "mint_y": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Mint of token Y."
+          },
+          "decimals_x": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Decimals of token X. Null until fetched.",
+            "minimum": 0
+          },
+          "decimals_y": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Decimals of token Y. Null until fetched.",
+            "minimum": 0
+          },
+          "first_swap_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. Block time of the pool's first indexed swap. Buckets before it read zero because nothing was indexed, not because nothing traded. Null before the first swap and while `pool_stats` rebuilds."
+          },
+          "bucket": {
+            "type": "string",
+            "enum": [
+              "hour",
+              "day"
+            ],
+            "description": "Bucket size that applied."
+          },
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. Aligned window start, inclusive."
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. Aligned window end, exclusive."
+          },
+          "buckets": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Every bucket from `from` to `to`, oldest first, with none missing.",
+            "items": {
+              "$ref": "#/components/schemas/VolumeBucket"
+            }
+          }
+        }
+      },
+      "Swap": {
+        "type": "object",
+        "description": "One decoded swap.",
+        "additionalProperties": false,
+        "required": [
+          "signature",
+          "swap_ordinal",
+          "slot",
+          "block_time",
+          "user",
+          "direction",
+          "mint_in",
+          "mint_out",
+          "amount_in",
+          "amount_out",
+          "fee",
+          "protocol_fee",
+          "host_fee",
+          "fee_rate_1e9",
+          "mm_fee",
+          "limit_order_fee",
+          "amount_left",
+          "fee_side",
+          "fee_token",
+          "quote_asset",
+          "volume_usd",
+          "source",
+          "fill_job_id"
+        ],
+        "properties": {
+          "signature": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{64,88}$",
+            "description": "Base58 transaction signature."
+          },
+          "swap_ordinal": {
+            "type": "integer",
+            "description": "Position of this swap among the DLMM swaps of its transaction, from 0. With `signature` it identifies the swap.",
+            "minimum": 0
+          },
+          "slot": {
+            "type": "integer",
+            "description": "Slot of the block.",
+            "minimum": 0
+          },
+          "block_time": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. Block time."
+          },
+          "user": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. The swap event's `from`: the account that swapped. A router's account when the swap was routed."
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "x_to_y",
+              "y_to_x"
+            ],
+            "description": "Which pool token went in."
+          },
+          "mint_in": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Mint of the input token."
+          },
+          "mint_out": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Mint of the output token."
+          },
+          "amount_in": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Input amount."
+          },
+          "amount_out": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Output amount."
+          },
+          "fee": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Total fee."
+          },
+          "protocol_fee": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Protocol share of `fee`."
+          },
+          "host_fee": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Host (referrer) share of `fee`."
+          },
+          "fee_rate_1e9": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Fee rate scaled by 1e9 (100000000 is 10%). Integer string."
+          },
+          "mm_fee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Market-maker share of `fee`, from the `Swap2Evt` event. Null when the swap has no decoded `Swap2Evt`."
+          },
+          "limit_order_fee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). Limit-order share of `fee`, from `Swap2Evt`. Null without `Swap2Evt`."
+          },
+          "amount_left": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+$",
+            "description": "Integer string in the token's raw base units (not scaled by decimals). `Swap2Evt.amount_left`. Null without `Swap2Evt`."
+          },
+          "fee_side": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "input",
+              "output",
+              null
+            ],
+            "description": "Whether the fee was charged on the input or the output token, from `Swap2Evt`. Null without `Swap2Evt`."
+          },
+          "fee_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "x",
+              "y",
+              null
+            ],
+            "description": "Pool token the fee is denominated in, from `Swap2Evt`. Null without `Swap2Evt`."
+          },
+          "quote_asset": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "SOL",
+              "USDC",
+              "USDT",
+              null
+            ],
+            "description": "The leg that priced the swap. Null when neither mint is SOL, USDC or USDT."
+          },
+          "volume_usd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+(\\.[0-9]+)?$",
+            "description": "Exact decimal string, no exponent, trailing zeros removed. USD value of the swap from its quote leg. Null when the swap is unpriced."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "live_geyser",
+              "live_rpc",
+              "fill"
+            ],
+            "description": "Path that indexed the swap: the Geyser stream, the RPC tail, or a fill job."
+          },
+          "fill_job_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Id of the fill job that indexed the swap. Null unless `source` is `fill`.",
+            "minimum": 1
+          }
+        }
+      },
+      "CursorPage": {
+        "type": "object",
+        "description": "Keyset paging state.",
+        "additionalProperties": false,
+        "required": [
+          "limit",
+          "next_cursor"
+        ],
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "The page size that applied.",
+            "minimum": 1
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque cursor; send it as `before` for the next older page. Null on the last page."
+          }
+        }
+      },
+      "SwapList": {
+        "type": "object",
+        "description": "One page of a pool's swaps.",
+        "additionalProperties": false,
+        "required": [
+          "pool",
+          "swaps",
+          "page"
+        ],
+        "properties": {
+          "pool": {
+            "type": "string",
+            "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "description": "Base58 32-byte address. Pool address."
+          },
+          "swaps": {
+            "type": "array",
+            "description": "Swaps, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/Swap"
+            }
+          },
+          "page": {
+            "$ref": "#/components/schemas/CursorPage"
+          }
+        }
+      },
+      "BackfillRequest": {
+        "type": "object",
+        "description": "Backfill request. Unknown keys are ignored.",
+        "required": [
+          "from"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 instant with any offset, not in the future. The job starts at the first slot at or after it."
+          }
+        }
+      },
+      "BackfillAccepted": {
+        "type": "object",
+        "description": "The inserted job.",
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "start_slot",
+          "end_slot"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "integer",
+            "description": "Job id.",
+            "minimum": 1
+          },
+          "start_slot": {
+            "type": "integer",
+            "description": "First slot at or after `from`, inclusive.",
+            "minimum": 0
+          },
+          "end_slot": {
+            "type": "integer",
+            "description": "The slot below the oldest indexed slot, inclusive.",
+            "minimum": 0
+          }
+        }
+      },
+      "BackfillJobState": {
+        "type": "string",
+        "description": "Derived job state. `completed`: the reconciler found the whole range covered. `cancelled`: blocked with reason `cancelled`. `blocked`: blocked with another reason; an operator must act. `open`: none of these.",
+        "enum": [
+          "open",
+          "blocked",
+          "cancelled",
+          "completed"
+        ]
+      },
+      "BackfillJob": {
+        "type": "object",
+        "description": "One fill job.",
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "state",
+          "start_slot",
+          "end_slot",
+          "next_slot",
+          "end_kind",
+          "blocked_reason",
+          "completed_at",
+          "created_at"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "integer",
+            "description": "Job id.",
+            "minimum": 1
+          },
+          "state": {
+            "$ref": "#/components/schemas/BackfillJobState"
+          },
+          "start_slot": {
+            "type": "integer",
+            "description": "First slot of the job's range, inclusive.",
+            "minimum": 0
+          },
+          "end_slot": {
+            "type": "integer",
+            "description": "Last slot of the job's range, inclusive.",
+            "minimum": 0
+          },
+          "next_slot": {
+            "type": "integer",
+            "description": "The next slot the filler walks. Above `end_slot` once the walk is done; the job is `completed` only after the reconciler finds its whole range covered.",
+            "minimum": 0
+          },
+          "end_kind": {
+            "type": "string",
+            "enum": [
+              "block",
+              "archive_lower_cut"
+            ],
+            "description": "How `end_slot` was set. `block`: a known block (a hole's end, the archive window's top, or an unmappable slot). `archive_lower_cut`: the slot below the archive's bottom when the reconciler cut the job; it may be a skipped slot."
+          },
+          "blocked_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the job is blocked: `cancelled`, or a reason the filler wrote (for example `missing_in_storage:<slot>`). Null when not blocked."
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. When the reconciler marked the job completed. Null until then."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            "description": "RFC 3339 instant in UTC, whole seconds, `Z` suffix. When the job was inserted."
+          }
+        }
+      },
+      "BackfillJobList": {
+        "type": "object",
+        "description": "Jobs, newest first.",
+        "additionalProperties": false,
+        "required": [
+          "jobs"
+        ],
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "maxItems": 50,
+            "description": "At most 50 jobs, newest first by `created_at`.",
+            "items": {
+              "$ref": "#/components/schemas/BackfillJob"
+            }
+          }
+        }
+      },
+      "BackfillCancel": {
+        "type": "object",
+        "description": "The cancelled job.",
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "start_slot",
+          "end_slot",
+          "next_slot",
+          "state"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "integer",
+            "description": "Job id.",
+            "minimum": 1
+          },
+          "start_slot": {
+            "type": "integer",
+            "description": "First slot of the job's range, inclusive.",
+            "minimum": 0
+          },
+          "end_slot": {
+            "type": "integer",
+            "description": "Last slot of the job's range, inclusive.",
+            "minimum": 0
+          },
+          "next_slot": {
+            "type": "integer",
+            "description": "Where the walk stopped: slots from here to `end_slot` stay unfilled.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "cancelled"
+            ],
+            "description": "Always `cancelled`."
+          }
+        }
+      }
+    }
+  }
+}

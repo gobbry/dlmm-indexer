@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -9,9 +10,11 @@ use dlmm_core::gateway::rpc::{Endpoint, RpcGateway, Url};
 use dlmm_core::store::reconcile;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
 struct Response {
     status: u16,
+    content_type: Option<String>,
     body: Value,
 }
 
@@ -64,8 +67,94 @@ async fn send(address: SocketAddr, request: String) -> Response {
         .nth(1)
         .and_then(|code| code.parse().ok())
         .expect("status line has a code");
+    let content_type = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.trim().to_owned());
     let body = serde_json::from_str(body).expect("body is JSON");
-    Response { status, body }
+    Response {
+        status,
+        content_type,
+        body,
+    }
+}
+
+fn openapi() -> Value {
+    serde_json::from_str(include_str!("../openapi.json")).expect("api/openapi.json is JSON")
+}
+
+fn openapi_schema<'spec>(spec: &'spec Value, schema: &'spec Value) -> &'spec Value {
+    let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+        return schema;
+    };
+    let name = reference
+        .strip_prefix("#/components/schemas/")
+        .expect("a $ref into components.schemas");
+    let target = &spec["components"]["schemas"][name];
+    assert!(target.is_object(), "{reference} resolves");
+    target
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+// Type, enum and object keys only: the subset of JSON Schema the spec uses for bodies. Keys must
+// sit between `required` and `properties`, so an undocumented or a dropped field both fail.
+fn assert_conforms(spec: &Value, schema: &Value, value: &Value, at: &str) {
+    let schema = openapi_schema(spec, schema);
+    let actual = json_type(value);
+    let allowed: Vec<&str> = match &schema["type"] {
+        Value::String(kind) => vec![kind.as_str()],
+        Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
+        _ => panic!("{at}: schema has no type"),
+    };
+    assert!(
+        allowed.contains(&actual) || (actual == "integer" && allowed.contains(&"number")),
+        "{at}: {actual} is not one of {allowed:?}"
+    );
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        assert!(values.contains(value), "{at}: {value} is not in {values:?}");
+    }
+    match value {
+        Value::Object(fields) => {
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{at}: object schema has properties"));
+            let keys: BTreeSet<&str> = fields.keys().map(String::as_str).collect();
+            let declared: BTreeSet<&str> = properties.keys().map(String::as_str).collect();
+            let undeclared: Vec<&&str> = keys.difference(&declared).collect();
+            assert!(undeclared.is_empty(), "{at}: undocumented {undeclared:?}");
+            let required = schema["required"].as_array().into_iter().flatten();
+            for name in required.filter_map(Value::as_str) {
+                assert!(keys.contains(name), "{at}: required {name} is missing");
+            }
+            for (name, field) in fields {
+                assert_conforms(spec, &properties[name], field, &format!("{at}.{name}"));
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                assert_conforms(spec, &schema["items"], item, &format!("{at}[{index}]"));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_body_is(response: &Response, schema_name: &str) {
+    let spec = openapi();
+    let schema = json!({ "$ref": format!("#/components/schemas/{schema_name}") });
+    assert_conforms(&spec, &schema, &response.body, schema_name);
 }
 
 async fn seed(database: &PgPool, pool: &str, mint_x: &str, mint_y: &str) {
@@ -165,6 +254,7 @@ async fn hourly_volume_aligns_the_range_and_fills_empty_buckets(database: PgPool
     )
     .await;
     assert_eq!(hourly.status, 200);
+    assert_body_is(&hourly, "Volume");
     let filled = json!({
         "start": "2026-10-01T01:00:00Z", "swap_count": 3,
         "volume_x": "1532.123456789", "volume_x_raw": "1532123456789",
@@ -237,6 +327,7 @@ async fn health_reports_starting_on_empty_database(database: PgPool) {
     let address = serve(database).await;
     let health = get(address, "/v1/health").await;
     assert_eq!(health.status, 200);
+    assert_body_is(&health, "Health");
     assert_eq!(
         health.body,
         json!({
@@ -283,6 +374,7 @@ async fn volume_answers_503_while_projection_rebuilds(database: PgPool) {
 
     let health = get(address, "/v1/health").await;
     assert_eq!(health.status, 200);
+    assert_body_is(&health, "Health");
     assert_eq!(health.body["rebuilding"], json!(["pool_volume_1d"]));
 }
 
@@ -345,6 +437,7 @@ async fn pool_reads_answer_503_only_for_rebuilding_tables(database: PgPool) {
 }
 
 fn error_code(response: &Response) -> (u16, &str) {
+    assert_body_is(response, "ErrorEnvelope");
     let code = response.body["error"]["code"]
         .as_str()
         .expect("an error envelope");
@@ -449,6 +542,7 @@ async fn cancel_blocks_an_open_job_and_refuses_the_rest(database: PgPool) {
 
     let cancelled = delete(address, &format!("/v1/backfills/{open}")).await;
     assert_eq!(cancelled.status, 200);
+    assert_body_is(&cancelled, "BackfillCancel");
     assert_eq!(
         cancelled.body,
         json!({
@@ -479,6 +573,7 @@ async fn cancel_blocks_an_open_job_and_refuses_the_rest(database: PgPool) {
 
     let read = get(address, &format!("/v1/backfills/{open}")).await;
     assert_eq!(read.status, 200);
+    assert_body_is(&read, "BackfillJob");
     assert_eq!(read.body["state"], "cancelled");
     assert_eq!(read.body["blocked_reason"], "cancelled");
     let unknown_read = get(address, "/v1/backfills/999999").await;
@@ -532,6 +627,7 @@ async fn backfill_list_is_newest_first_and_capped_at_fifty(database: PgPool) {
 
     let list = get(address, "/v1/backfills").await;
     assert_eq!(list.status, 200);
+    assert_body_is(&list, "BackfillJobList");
     let jobs = list.body["jobs"].as_array().expect("a jobs list");
     assert_eq!(jobs.len(), 50);
     let newest = &jobs[0];
@@ -631,6 +727,7 @@ async fn swaps_pages_meet_exactly_under_a_head_insert(database: PgPool) {
 
     let first = get(address, &format!("{swaps_path}?limit=17")).await;
     assert_eq!(first.status, 200);
+    assert_body_is(&first, "SwapList");
     assert_eq!(first.body["page"]["limit"], 17);
     let pool = PoolAddress::new([1; 32]).to_string();
     let mint_x = MintAddress::new([2; 32]).to_string();
@@ -649,6 +746,7 @@ async fn swaps_pages_meet_exactly_under_a_head_insert(database: PgPool) {
     )
     .await;
     assert_eq!(third.status, 200);
+    assert_body_is(&third, "SwapList");
     assert_eq!(next_cursor(&third), None);
     let paged: Vec<String> = [&first, &second, &third]
         .into_iter()
@@ -773,6 +871,7 @@ async fn pools_page_by_offset_with_total(database: PgPool) {
     for offset in [0, 2, 4] {
         let page = get(address, &format!("/v1/pools?limit=2&offset={offset}")).await;
         assert_eq!(page.status, 200);
+        assert_body_is(&page, "PoolList");
         assert_eq!(
             page.body["page"],
             json!({"limit": 2, "offset": offset, "total": 5})
@@ -818,6 +917,7 @@ async fn pool_route_answers_one_summary(database: PgPool) {
 
     let summary = get(address, &format!("/v1/pools/{pool}")).await;
     assert_eq!(summary.status, 200);
+    assert_body_is(&summary, "Pool");
     assert_eq!(
         summary.body,
         json!({
@@ -831,4 +931,73 @@ async fn pool_route_answers_one_summary(database: PgPool) {
     assert_eq!(error_code(&unknown), (404, "pool_not_found"));
     let malformed = get(address, "/v1/pools/not-a-pool").await;
     assert_eq!(error_code(&malformed), (400, "invalid_pool"));
+}
+
+const OPENAPI_METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
+
+// Adding, removing or moving a route without the same change to api/openapi.json fails here.
+#[test]
+fn openapi_lists_exactly_the_registered_routes() {
+    let spec = openapi();
+    let paths = spec["paths"].as_object().expect("paths is an object");
+    let documented: BTreeSet<(String, String)> = paths
+        .iter()
+        .flat_map(|(path, item)| {
+            let methods = item.as_object().expect("a path item is an object");
+            methods
+                .keys()
+                .filter(|method| OPENAPI_METHODS.contains(&method.as_str()))
+                .map(|method| (method.to_uppercase(), path.clone()))
+        })
+        .collect();
+    let served: BTreeSet<(String, String)> = dlmm_api::ROUTES
+        .iter()
+        .map(|route| (route.method().to_string(), route.path().to_owned()))
+        .collect();
+    assert_eq!(documented, served);
+}
+
+fn collect_refs<'spec>(value: &'spec Value, refs: &mut Vec<&'spec str>) {
+    match value {
+        Value::Object(fields) => {
+            refs.extend(fields.get("$ref").and_then(Value::as_str));
+            fields.values().for_each(|field| collect_refs(field, refs));
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect_refs(item, refs)),
+        _ => {}
+    }
+}
+
+// The document declares 3.1, carries the crate's version, and every $ref resolves, so a client
+// generator can load it.
+#[test]
+fn openapi_is_valid_json_and_version_3_1() {
+    let spec = openapi();
+    assert_eq!(spec["openapi"], "3.1.0");
+    assert_eq!(spec["info"]["version"], env!("CARGO_PKG_VERSION"));
+    let mut refs = Vec::new();
+    collect_refs(&spec, &mut refs);
+    assert!(!refs.is_empty());
+    for reference in refs {
+        let name = reference
+            .strip_prefix("#/components/schemas/")
+            .unwrap_or_else(|| panic!("{reference} points into components.schemas"));
+        assert!(
+            spec["components"]["schemas"][name].is_object(),
+            "{reference} resolves"
+        );
+    }
+}
+
+// A running instance serves the embedded document as JSON; no route of it touches the database.
+#[tokio::test]
+async fn openapi_route_serves_the_embedded_document() {
+    let database = PgPoolOptions::new()
+        .connect_lazy("postgres://127.0.0.1:9/unused")
+        .expect("a lazy pool needs no server");
+    let address = serve(database).await;
+    let served = get(address, "/openapi.json").await;
+    assert_eq!(served.status, 200);
+    assert_eq!(served.content_type.as_deref(), Some("application/json"));
+    assert_eq!(served.body, openapi());
 }

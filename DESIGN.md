@@ -5,109 +5,93 @@ Full reasoning: `docs/plans/2026-10-01-system-design.md`.
 
 ## 1. Data source
 
-For efficiency, protocol often average far more than 10 DLMM transactions per slot, making it expensive to index via `getTransaction`. All indexing is done by decoding blocks instead.
-For simplicity, ingestion is by finalized block: this makes it easy to detect gaps via a block's `parent_slot`.
-For checkpointing, store a cursor and query `from_slot = cursor + 1`. DB writes and event processing should always be idempotent by default as indexing may duplicate.
+- DLMM often averages far more than 10 transactions per slot, so `getTransaction` per swap is expensive.
+- Ingestion is by finalized blocks. This means gap detection is simple via `parent_slot`.
+- Checkpointing is done via a virtual `cursor`
 
-Realtime:
-> Goal is to continue indexing in realtime despite gaps or historical backfilling required
-1. Yellowstone gRPC (Primary), with `blocks` filter on `finalized`. Uses an alternative polling when `GEYSER_ENDPOINT` is not set.
-2. Alternative via RPC polling every x seconds, with `getBlocks(cursor+1,cursor+max(64,x/0.2))` and `getBlock`. `getSlot(finalized)` is used to seed cursor at start or to measure indexing lag. Notably, indexing lag can occur in which it snapshots back to the latest finalized slot instead of trying to catch up, relying on historical data source to fill gaps.
+Live:
+1. Yellowstone gRPC (primary), with a `blocks` filter on `finalized`. Without `GEYSER_URL`, the indexer uses the RPC tail.
+2. RPC polling: `getBlocks(cursor+1, cursor+max(64,x/0.2))` and `getBlock` every x seconds. `getSlot(finalized)` seeds the cursor and measures lag. A tail far behind jumps to the tip instead of trying to catch up.
 
-Historical (or gaps found):
-> Goal is to fill gaps and then backfill historically
-1. Gaps are found by reconciliation when a block's `parent_slot` does not match the predecessor.
-2. Backfilling is done via indexing from a block at a historical point of time to a cached live block. Job is not completed until it has fully indexed till the cached live block.
-3. Gaps or backfills older than 1 week ago go to the Old Faithful archive to reduce RPC cost.
+Historical:
+1. A backfill indexes from a historical block to a cached live block.
+2. Gaps or backfills older than 1 week go to the Old Faithful archive to reduce RPC cost.
+
+Ingestion is source-agnostic - every source (Geyser stream, RPC tail, archive filler) produces the same `FinalizedBlock`. The design is event-driven and kappa-style: one stream-processing path, and reprocessing replays blocks through it.
 
 ## 2. Redundancy
 
-Completeness is a fact in the database, not an event an actor must notice. `slot_coverage` holds the contiguous slot ranges fully indexed; every block write, live or fill, covers `(parent_slot, slot]` in the same transaction as its swaps, so skipped slots are covered by the chain's own word and a crash anywhere leaves coverage exact.
+`slot_coverage` are contiguous indexed slot ranges. A reconciler loop computes the difference to the desired state (of no gaps). It opens one `slot_range_job` per gap, nearest the tip first.
 
-A reconciler tick derives the holes between `BACKFILL_FROM` (or the first live slot) and the top range and opens one `slot_range_job` per hole that has none; an exclusion constraint forbids overlapping jobs. A Geyser drop, a tail more than 150 slots behind jumping to the tip, a restart and a historical backfill are all just holes, nearest the tip first.
+The loop is level-triggered. It reads the state every tick and does not react to gap events. Thus a crash, a dropped stream message, a tail jump and a cancelled backfill are all the same. A missed event can never become a lost gap. Every block write covers `(parent_slot, slot]` in the same transaction as its swaps.
 
-A job is complete only when coverage contains its range; a block the node has lost marks it `blocked_reason`, never a silent completion. Live and fill draw from separate shares of the request budget (60/40), under a GCRA limiter and jittered backoff honouring `Retry-After`. One instance runs under `pg_try_advisory_lock`; the unique swap key would make a second writer safe but wasteful.
+A backfill is a `POST /v1/backfills` request. The API inserts the job, and the reconciler splits it at the week line. A job is complete only when coverage contains its range. A block that the node lost sets `blocked_reason`.
 
-When the stream disconnects or is silent for 30 s, the RPC tail takes over from the cursor and stops once the stream delivers again; both write through the same cursor, so the handover is a cursor read, not a reconciliation.
+Live and fill draw from separate shares of the request budget (60/40). A GCRA limiter meters both. Backoff adds jitter and obeys `Retry-After`. One instance runs under `pg_try_advisory_lock`.
+
+When the stream is silent for 30 s, the RPC tail starts from the cursor. It stops when the stream delivers again.
 
 ## 3. Database and schema
 
-Database: TimescaleDB with exact `NUMERIC`, unique-key idempotency and hypertable chunks.
-SQL Domains: `solana_address`, `solana_signature`, `u64` (`NUMERIC(20,0)`)
+Database: TimescaleDB to store time-series data. Relying on hypertable chunks, `NUMERIC` and unique-key idempotency.
+QL Domains: `solana_address`, `solana_signature`, `u64` (`NUMERIC(20,0)`)
 Schema:
-- `swap`: append-only event log (1-day chunks) containing `Swap` event, `Swap2Evt` fee split, the quote leg, `volume_usd` and `source` (`live_geyser`, `live_rpc`, `fill`)
-- `pool` and `token`: created upon detection of pool or token
-- `price`: `(asset, ts, source)` for prices of assets 
+- `swap`: append-only event store (1-day chunks). It holds the `Swap` event, the `Swap2Evt` fee split, the quote leg, `volume_usd` and `source` (`live_geyser`, `live_rpc`, `fill`)
+- `pool`, `token`: created on first sight. `price`: `(asset, ts, source)`
+- `slot_coverage`, `slot_range_job`, `decode_failure` (one row per `(signature, reason)`)
+- `pool_volume_1h`, `pool_volume_1d`: per `(pool, bucket)` counts and volumes
+- `pool_stats`: lifetime totals per pool. `projection`: state per projection
 
-- `slot_coverage`: contiguous covered slot ranges (to prevent re-indexing), the latest end (top of `slot_coverage`) is the cursor
-- `decode_failure`: one row per `(signature, reason)` as a dead letter and debugging for transactions the decoder fails
-- `slot_range_job`: queue for gaps and backfilling
+Strictly no ORM used. The domain schema (Rust) and data schema (SQL) are distinct. `convert.rs` maps them once at the boundary to prevent object-relational impedance mismatch. Rust uses newtypes, sum types and a typestate while SQL uses domains and constraints.
 
-- `pool_volume_1h` and `pool_volume_1d`: `(pool, bucket)`, swap count, volume in each
-  token and in USD, unpriced count
-- `pool_stats`: per pool, lifetime totals and first and last swap time.
-- `projection`: one row per projection with its version, log cursor and state
-  (`live` or `building`)
+The design uses revent sourcing. The `swap` table is the core log of on-chain swap events. `volume_usd` and `price_ts` are late-bound stream enrichment.
+
+`pool_volume_1h`, `pool_volume_1d` and `pool_stats` are projections: materialised read models.
 
 ## 4. Idempotency
 
-A swap is `(signature, swap_ordinal)` but unique key is `(signature, swap_ordinal, block_time)`: the ordinal is its position among DLMM swap instructions in execution order, deterministic for a given transaction. `block_time` is required because a hypertable key must include the partition column.
+Delivery is at least once from every source. The writes make it effectively once. The natural key `(signature, swap_ordinal)` is the identity. The ordinal is the swap's position among DLMM swaps in execution order.
 
-Inserts are `ON CONFLICT DO NOTHING RETURNING`, so a replayed block projects nothing. Job progress (next_slot) moves with `GREATEST` and the cursor is the top of `slot_coverage`
+Inserts are `ON CONFLICT DO NOTHING RETURNING`. The writer folds only the returned rows into projections. Thus a replayed block is a no-op at every layer. Coverage merge and job progress (`next_slot` by `GREATEST`) are monotone. The cursor derives from coverage and is not stored. The filler verifies the parent chain. The design assumes exactly-once only of the effect, never of the transport.
 
 ## 5. Decoding
 
-A DLMM swap is any instruction, top-level or inner, whose program is DLMM and whose first
-eight bytes are one of six discriminators (`swap`, `swap2`, `swap_exact_out`,
-`swap_exact_out2`, `swap_with_price_impact`, `swap_with_price_impact2`). All six instructions share the same account layout (0 as pool, 6 & 7 as mints, 10 as user) regardless of direct swaps or external routers.
+A DLMM swap is any DLMM instruction, top-level or inner, with one of six discriminators (`swap`, `swap2`, `swap_exact_out`, `swap_exact_out2`, `swap_with_price_impact`, `swap_with_price_impact2`). All six share one account layout (0 pool, 6 and 7 mints, 10 user). This is the same even for direct swaps and for routers.
 
-DLMM emits events by `emit_cpi!`: a self-CPI whose data is sha256("anchor:event")[:8], the event discriminator, then Borsh. A swap's events are the self-CPIs at height `h + 1` after it, up to the next instruction at `<= h`.
-- `Swap` gives amounts and fees;
-- `Swap2Evt` gives the fee split (`mm_fee`, `limit_order_fee`, `amount_left`, `fee_side`, `fee_token`)
-- Disagreements can happen with `Swap`, marking it as an `EventMismatch`, and `fee = mm_fee + protocol_fee + limit_order_fee + host_fee` must hold.
+DLMM emits events by `emit_cpi!`: a self-CPI whose data is sha256("anchor:event")[:8], the event discriminator, then Borsh. A swap's events are the self-CPIs at height `h + 1` after it, up to the next instruction at `<= h`. `Swap` gives amounts and fees. `Swap2Evt` gives the fee split. When the two disagree, the decoder marks an `EventMismatch`. `fee = mm_fee + protocol_fee + limit_order_fee + host_fee` must hold.
 
-Failed transactions are dropped before decoding; a fixture proves why (a failed route still carries an executed `Swap` event). Malformed input does not panic and is always persisted as a `Result`in `decode_failure`.
+The indexer drops failed transactions before decoding. A fixture proves why: a failed route still carries an executed `Swap` event. Malformed input never panics. It goes to `decode_failure`, a dead-letter table. The indexer keeps the failures for a redecode and does not consume them.
 
 ## 6. API design
 
-`GET /v1/pools/{pool}/volume?bucket=hour|day&from&to` (RFC 3339, any offset, converted to
-UTC); `from` floored and `to` ceiled to the bucket and echoed; buckets `[start, end)`
-labelled by start; caps 744 hourly or 366 daily. Every bucket appears; empty ones have
-`volume_usd: null`. Amounts are strings in raw and human units (scaled by
-`token.decimals`); the response carries mints, decimals and `first_swap_at`. Also
-`/v1/health` (`starting`, `lagging`, `blocked`, `backfilling` or `ok`; never 503 on lag),
-`/v1/pools`, `/v1/pools/{pool}/swaps`. Errors: `{error: {code, message}}`. The API is
-read-only (`api_reader`).
+The services follow Command Query Responsibility Segration (CQRS). The indexer is the command side and owns every write. The API is the query side over denormalised projections. CQRS separates models and responsibilities, allowing both the indexer and API to scale differently.
+
+`GET /v1/pools/{pool}/volume?bucket=hour|day&from&to` takes RFC 3339 times with any offset and converts them to UTC. The API floors `from`, ceils `to` and echoes both. Buckets are `[start, end)`, labelled by start, at most 744 hourly or 366 daily. Empty buckets appear with `volume_usd: null`. Amounts are strings in raw and human units. Health reports `starting`, `lagging`, `blocked`, `backfilling` or `ok`, and never answers 503 on lag. Errors: `{error: {code, message}}`. `api/openapi.json` (served at `GET /openapi.json`) lists every route. The query routes are read-only by construction (SELECT only). The DSN decides the database user.
 
 ## 7. Pricing
 
-Only SOL, USDC and USDT is currently used to price the swap's quote leg in USD. However, there exists cases where these 3 do not sufficiently cover them (<3%). In such cases, simply do not price them yet.
+The indexer prices a swap's quote leg in USD only through SOL, USDC and USDT. These three assets miss about <3% of swaps, which stay unpriced for now.
 
-For binance as source, prices are Binance 1m close prices. A swap can take the latest price at or before its block time, within a minute, from the configured source, or stays unpriced until the feed's sweep fills it.
-
-In future, using Birdeye (which requires a key) or a path-finding algo using DLMM pools such that it routes to one of the majors should be implemented.
+Prices are Binance 1m close prices. A swap takes the latest price at or before its block time, within one minute. Otherwise it stays unpriced until the feed's sweep fills it. A future version should use Birdeye (which requires a key) or a path search over DLMM pools to one of the majors.
 
 ## 8. Scaling
 
-Choke points, where each sits here, and what replaces it:
+The in-process version is an actor system. A supervisor, sources, filler, processor and price feed exchange `FinalizedBlock` messages over bounded channels, so backpressure holds by construction. The queue version replaces the channels with topics partitioned by slot. The writer becomes a consumer group, and the block transaction fences its offsets. The model does not change, because identity, coverage and commutative projections already make every stage idempotent. `SCALE.md` has the measurements.
 
 | choke point | this design | at scale |
 |---|---|---|
-| ingress: 8 MB per block over RPC at <5 blocks/s (0.2 s slots); free tiers answer 429 | Geyser primary (one message per block, no polling), RPC tail as fallback, two-lane GCRA limiter | Geyser producer writes finalized blocks to a Kafka/Redpanda topic keyed by slot; the topic is the buffer, the replay and the fan-out |
-| decode CPU | pure, allocation-light, per block | stateless decoder consumers scaled horizontally; safe because identity is `(signature, swap_ordinal)` |
-| the single writer: one transaction per block, about 7 round trips, 3 ms | 80x headroom at 400 ms slots | writers partitioned by pool over the same unique key; a block fans out by pool; the cursor becomes per-partition offsets |
+| ingress: 1 to 4 MB decoded per block, 80 to 180 KB on the wire with zstd, at <5 blocks/s (0.2 s slots). Free tiers answer 429 | Geyser primary (one message per block, no polling), RPC tail as fallback, two-lane GCRA limiter | Geyser producer writes finalized blocks to a Kafka/Redpanda topic keyed by slot. The topic is the buffer, the replay and the fan-out |
+| decode CPU | pure, allocation-light, per block | stateless decoder consumers scale horizontally. Safe because identity is `(signature, swap_ordinal)` |
+| the single writer: one transaction per block, about 7 round trips, 3 ms | 80x headroom at 400 ms slots | writers as a consumer group partitioned by slot hash. One transaction per block with its coverage, offsets fenced in that transaction. Measured 1.66x with two writers and 2.55x with four (`SCALE.md`) |
 | hot projection rows | one upsert per (pool, hour) per block, HOT updates | projections as consumers with their own cursors (the `projection` table already holds them), deltas batched per N blocks |
-| price lookups | `price_at`: latest eligible row in `(t − 60 s, t]` by index scan on immutable rows; partial index for the sweep | the price feed as its own topic consumer |
-| the event log and reads | hypertable chunks, covering indexes, read-only role | compression after 7 days, read replicas, ClickHouse (`ReplacingMergeTree` plus `AggregatingMergeTree`) for analytics |
-| gap-fill backlog: 9,000 `getBlock` per hour of gap; DLMM is ~70 of each block's transactions, so blocks move ~15x the bytes needed but cost ~50x fewer metered calls than per-transaction fetching | fill lane, parent-chain verification, blocked jobs | deep replay (LaserStream 48 h); signature paging plus `getTransaction` where bandwidth is metered rather than calls; Old Faithful for bulk history |
-
-The queue version is a refactor: components already talk in `FinalizedBlock` and
-`(signature, swap_ordinal)`, and exactly-once stays the cursor plus the unique key.
+| price lookups | `price_at`: latest eligible row in `(t − 60 s, t]` by index scan on immutable rows. Partial index for the sweep | the price feed as its own topic consumer |
+| the event log and reads | hypertable chunks, covering indexes, SELECT-only reads | compression after 7 days, read replicas, ClickHouse (`ReplacingMergeTree` plus `AggregatingMergeTree`) for analytics |
+| gap-fill backlog: 9,000 `getBlock` per hour of gap. DLMM is ~70 of each block's transactions. Blocks thus move ~15x the bytes needed, but cost ~50x fewer metered calls than per-transaction fetching | fill lane, parent-chain verification, blocked jobs | deep replay (LaserStream 48 h). Signature paging plus `getTransaction` where bandwidth is metered rather than calls. Old Faithful for bulk history |
 
 ## 9. Next steps
 
-Not done: Geyser verified against a live provider (tested only against an in-process
-server, for want of a credential); one-hop pool pricing for the unquoted 2 percent; online
-projection rebuild (correct because projections commute); a coverage-aware compare against
-Meteora's Data API with drift alerts. Then a redecode command for `decode_failure`, and
-metrics.
+- One-hop pool pricing for the unpriced (about 2 percent).
+- Online projection rebuild.
+- A coverage-aware compare against Meteora's Data API with drift alerts.
+- A redecode command for `decode_failure`, and metrics.
+- Future scaling
