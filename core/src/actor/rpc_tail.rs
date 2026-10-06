@@ -270,7 +270,7 @@ mod tests {
     use crate::domain::config::{RpsMax, TransactionVersionMax};
     use crate::gateway::rpc::Endpoint;
 
-    // The listing window is the 64-slot floor at the 2 s tick and grows with a longer tick to
+    // The listing window is the 64-slot minimum at the 2 s tick and grows with a longer tick to
     // what a 0.2 s chain produces in it.
     #[test]
     fn tail_window_covers_a_tick_of_fast_slots() {

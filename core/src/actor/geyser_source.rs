@@ -250,6 +250,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use futures::channel::mpsc as stream_channel;
+    use tonic::codec::CompressionEncoding;
     use tonic::transport::Server;
     use tonic::transport::server::TcpIncoming;
     use tonic::{Request, Response, Status, Streaming};
@@ -273,10 +274,17 @@ pub(crate) mod tests {
     }
 
     #[derive(Default)]
+    pub(crate) struct ServerLog {
+        // Every request any client sent: subscriptions and ping replies.
+        pub(crate) requests: Mutex<Vec<SubscribeRequest>>,
+        // The grpc-accept-encoding header of each subscription, empty when absent.
+        pub(crate) accept_encodings: Mutex<Vec<String>>,
+    }
+
+    #[derive(Default)]
     struct ScriptedGeyser {
         scripts: Mutex<VecDeque<Script>>,
-        // Every request any client sent: subscriptions and ping replies.
-        requests: Arc<Mutex<Vec<SubscribeRequest>>>,
+        log: Arc<ServerLog>,
         // Holding a sender keeps its stream open and silent.
         silent: Mutex<Vec<UpdateSender>>,
     }
@@ -317,11 +325,22 @@ pub(crate) mod tests {
             &self,
             request: Request<Streaming<SubscribeRequest>>,
         ) -> Result<Response<Self::SubscribeStream>, Status> {
+            let accept_encoding = request
+                .metadata()
+                .get("grpc-accept-encoding")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            self.log
+                .accept_encodings
+                .lock()
+                .expect("lock")
+                .push(accept_encoding);
             let mut incoming = request.into_inner();
-            let requests = Arc::clone(&self.requests);
+            let log = Arc::clone(&self.log);
             tokio::spawn(async move {
                 while let Ok(Some(request)) = incoming.message().await {
-                    requests.lock().expect("lock").push(request);
+                    log.requests.lock().expect("lock").push(request);
                 }
             });
             let script = self.scripts.lock().expect("lock").pop_front();
@@ -425,7 +444,7 @@ pub(crate) mod tests {
     }
 
     struct Harness {
-        requests: Arc<Mutex<Vec<SubscribeRequest>>>,
+        log: Arc<ServerLog>,
         // Stands in for the processor's cursor: the last slot the test received.
         cursor: Arc<Mutex<Option<Slot>>>,
         live_receiver: mpsc::Receiver<ProcessorMessage>,
@@ -434,21 +453,19 @@ pub(crate) mod tests {
         source: tokio::task::JoinHandle<Result<(), GeyserSourceError>>,
     }
 
-    // Serves the scripts on a loopback port; returns a gateway pointed at it and the log of
-    // every request it received.
-    pub(crate) fn start_server(
-        scripts: Vec<Script>,
-    ) -> (GeyserGateway, Arc<Mutex<Vec<SubscribeRequest>>>) {
+    // Serves the scripts on a loopback port, zstd-compressing whatever the client accepts as
+    // the real provider does; returns a gateway pointed at it and the log of what it saw.
+    pub(crate) fn start_server(scripts: Vec<Script>) -> (GeyserGateway, Arc<ServerLog>) {
         let server = ScriptedGeyser {
             scripts: Mutex::new(scripts.into()),
             ..ScriptedGeyser::default()
         };
-        let requests = Arc::clone(&server.requests);
+        let log = Arc::clone(&server.log);
         let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("address")).expect("bind");
         let address = incoming.local_addr().expect("local address");
         tokio::spawn(
             Server::builder()
-                .add_service(GeyserServer::new(server))
+                .add_service(GeyserServer::new(server).send_compressed(CompressionEncoding::Zstd))
                 .serve_with_incoming(incoming),
         );
         let gateway = GeyserGateway::new(
@@ -457,7 +474,7 @@ pub(crate) mod tests {
             TransactionVersionMax::SUPPORTED,
         )
         .expect("gateway");
-        (gateway, requests)
+        (gateway, log)
     }
 
     // Reads a cursor the test advances itself, standing in for the processor's.
@@ -469,7 +486,7 @@ pub(crate) mod tests {
     }
 
     fn start(scripts: Vec<Script>, cursor: Option<Slot>) -> Harness {
-        let (gateway, requests) = start_server(scripts);
+        let (gateway, log) = start_server(scripts);
         let cursor = Arc::new(Mutex::new(cursor));
         let read_cursor = shared_cursor_reader(&cursor);
         let (live_sender, live_receiver) = mpsc::channel(16);
@@ -483,7 +500,7 @@ pub(crate) mod tests {
             health_sender,
         ));
         Harness {
-            requests,
+            log,
             cursor,
             live_receiver,
             health,
@@ -505,7 +522,7 @@ pub(crate) mod tests {
         }
 
         fn subscription_from_slots(&self) -> Vec<Option<u64>> {
-            let requests = self.requests.lock().expect("lock");
+            let requests = self.log.requests.lock().expect("lock");
             let subscriptions = requests.iter().filter(|request| !request.blocks.is_empty());
             subscriptions.map(|request| request.from_slot).collect()
         }
@@ -569,6 +586,7 @@ pub(crate) mod tests {
             vec![Some(100), Some(104)]
         );
         let ping_replies = harness
+            .log
             .requests
             .lock()
             .expect("lock")
@@ -592,6 +610,28 @@ pub(crate) mod tests {
         assert_eq!(block.slot, Slot::new(500));
         assert_eq!(harness.subscription_from_slots(), vec![Some(100), None]);
         assert_eq!(*harness.health.borrow(), GeyserHealth::Connected);
+        harness.stop().await;
+    }
+
+    // The provider's stream is mostly large token-balance tables, so the subscription asks
+    // for zstd, and a block the server sends compressed arrives intact.
+    #[tokio::test]
+    async fn subscription_accepts_zstd_and_decodes_compressed_blocks() {
+        let mut harness = start(
+            vec![Script::ServeThenSilence(vec![block_update(200)])],
+            Some(Slot::new(199)),
+        );
+        let block = harness.receive_block().await;
+        assert_eq!(block.slot, Slot::new(200));
+        assert_eq!(block.parent_slot, Slot::new(199));
+        let accept_encodings = harness.log.accept_encodings.lock().expect("lock").clone();
+        assert_eq!(accept_encodings.len(), 1);
+        assert!(
+            accept_encodings[0]
+                .split(',')
+                .any(|name| name.trim() == "zstd"),
+            "{accept_encodings:?}"
+        );
         harness.stop().await;
     }
 }

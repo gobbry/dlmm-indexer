@@ -21,8 +21,8 @@ use crate::gateway::rpc::{
     Endpoint, RequestLane, RpcGateway, is_answer_about_request, is_unmappable,
 };
 use crate::store::{
-    JobBlock, JobSelection, block_job, read_block_above_stuck, read_coverage_start_above,
-    read_open_jobs,
+    JobBlock, JobSelection, JobWalkState, block_job, read_block_above_stuck,
+    read_coverage_start_above, read_job_walk_state, read_open_jobs,
 };
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(10);
@@ -35,6 +35,10 @@ const WAITING_PASS_COUNT_WARN: u32 = 30;
 // or a CAR read that keeps failing, rather than a hiccup. A block answered as skipped is not
 // retried by the gateway, so the same budget there is thirty scans, about five minutes.
 const ARCHIVE_RETRY_PASS_COUNT_MAX: u32 = 30;
+// A page is up to a thousand slots, minutes of getBlock on a metered provider, so a job an
+// operator cancels mid-page must stop well before the page ends. One primary-key read per
+// this many fetched blocks bounds what a cancelled walk still sends.
+const JOB_RECHECK_FETCH_COUNT: u32 = 50;
 
 #[derive(Debug, Error)]
 pub enum FillerError {
@@ -49,13 +53,13 @@ pub enum FillerError {
 // How the next fetched block must link to what came before it in its job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChainLink {
-    // The previously fetched block.
     Parent(Slot),
     // A fresh job, or one resumed after a restart: the first block must not name a parent at
     // or after next_slot, which would be a block the listing omitted. A parent below it is
     // the chain's own proof that the slots between are skipped: a hole above a coverage range
-    // (parent = the range's end block), the floor (the block sits on next_slot), and a job cut
-    // at an archive window edge, whose start may follow a skipped slot, all pass.
+    // (parent = the range's end block), a job whose first slot is itself a block (the block
+    // sits on next_slot), and a job cut at an archive window edge, whose start may follow a
+    // skipped slot, all pass.
     Resumed { next_slot: Slot },
 }
 
@@ -337,8 +341,6 @@ struct Filler {
     fill_sender: mpsc::Sender<ProcessorMessage>,
     memory: HashMap<JobId, JobMemory>,
     waiting: HashMap<JobId, Waiting>,
-    // Consecutive passes each archive job ended without progress, on a retryable error or on a
-    // block the chain names that the archive answered as skipped.
     retry_pass_counts: HashMap<JobId, u32>,
 }
 
@@ -348,6 +350,7 @@ struct JobWalk {
     job: SlotRangeJob,
     link: ChainLink,
     pending: Option<FinalizedBlock>,
+    fetched_count: u32,
 }
 
 enum WalkStep {
@@ -478,6 +481,7 @@ impl Filler {
             job,
             link,
             pending: None,
+            fetched_count: 0,
         };
         if let WalkStep::Stop(outcome) = self.walk_page(&mut walk, page, receiver).await? {
             self.flush_pending(&mut walk).await?;
@@ -546,6 +550,30 @@ impl Filler {
             ControlFlow::Continue(()) => WalkStep::Continue,
             ControlFlow::Break(outcome) => WalkStep::Stop(outcome),
         })
+    }
+
+    // A job closed under the walk (an operator's cancel, mostly) gets nothing more: the held
+    // block is dropped rather than flushed, since its job no longer owns the slots.
+    async fn recheck_job(&mut self, walk: &mut JobWalk) -> Result<WalkStep, FillerError> {
+        walk.fetched_count = walk.fetched_count.saturating_add(1);
+        if !walk.fetched_count.is_multiple_of(JOB_RECHECK_FETCH_COUNT) {
+            return Ok(WalkStep::Continue);
+        }
+        match read_job_walk_state(&self.database, walk.job.id, walk.job.range.start).await? {
+            JobWalkState::Open => Ok(WalkStep::Continue),
+            JobWalkState::Closed => {
+                tracing::info!(
+                    job_id = walk.job.id.get(),
+                    fetched_count = walk.fetched_count,
+                    "fill_job_closed_mid_walk"
+                );
+                walk.pending = None;
+                self.memory.remove(&walk.job.id);
+                self.waiting.remove(&walk.job.id);
+                self.retry_pass_counts.remove(&walk.job.id);
+                Ok(WalkStep::Stop(PassOutcome::Idle))
+            }
+        }
     }
 
     async fn accept_block(
@@ -852,6 +880,9 @@ impl ListedBlockHandler for FillHandler<'_> {
         slot: Slot,
         result: FetchResult,
     ) -> Result<ControlFlow<PassOutcome>, FillerError> {
+        if let WalkStep::Stop(outcome) = self.filler.recheck_job(self.walk).await? {
+            return Ok(ControlFlow::Break(outcome));
+        }
         let step = match result {
             Ok(block) => self.filler.accept_block(self.walk, block).await?,
             Err(error) => {
@@ -1092,7 +1123,6 @@ mod tests {
         sent
     }
 
-    // A walk that fetched end_slot carries the job past it.
     #[sqlx::test(migrations = "../migrations")]
     async fn finish_job_carries_reached_end_past_it(database: PgPool) {
         // Never called: a reached end needs no RPC answer.
@@ -1105,6 +1135,7 @@ mod tests {
             },
             link: ChainLink::Parent(Slot::new(200)),
             pending: Some(block(200)),
+            fetched_count: 0,
         };
         let end_check = EndCheck::Relist {
             finalized_before_listing: Slot::new(200),
@@ -1481,6 +1512,7 @@ mod tests {
                     next_slot: lane.job.next_slot,
                 },
                 pending: None,
+                fetched_count: 0,
             };
             let error = refused_connection().await;
             lane.filler
@@ -1592,6 +1624,62 @@ mod tests {
         assert_eq!(
             blocked_reason(&database, lane.job.id).await.as_deref(),
             Some("end_unproven:199")
+        );
+    }
+
+    // A job an operator cancels while its page is walked stops sending at the next recheck,
+    // not at the end of the page: the cancel lands after ten blocks reach the processor, and
+    // the walk sends fewer than JOB_RECHECK_FETCH_COUNT of the page's three hundred, then
+    // leaves the reason it found.
+    #[sqlx::test(migrations = "../migrations")]
+    async fn job_cancelled_mid_walk_stops_at_the_next_recheck(database: PgPool) {
+        const CANCEL_AFTER_COUNT: usize = 10;
+        let chain: &'static [(u64, u64)] =
+            Vec::leak((100..400).map(|slot| (slot, slot - 1)).collect());
+        let mut lane = lane_with_job(
+            &database,
+            Endpoint::Provider,
+            (100, 399),
+            JobEndKind::Block,
+            0,
+            (chain, &[], &[]),
+        )
+        .await;
+        lane.filler.routing = routing(ArchiveRouting::Ready(None));
+        // Capacity one, so the walk cannot run ahead of the cancel by more than a block or two.
+        let (fill_sender, mut fills) = mpsc::channel(1);
+        lane.filler.fill_sender = fill_sender;
+        let job_id = lane.job.id;
+        let processor = {
+            let database = database.clone();
+            tokio::spawn(async move {
+                let mut received_count = 0;
+                while fills.recv().await.is_some() {
+                    received_count += 1;
+                    if received_count == CANCEL_AFTER_COUNT {
+                        sqlx::query(
+                            "UPDATE slot_range_job SET blocked_reason = 'cancelled' WHERE id = $1",
+                        )
+                        .bind(job_id.get())
+                        .execute(&database)
+                        .await
+                        .expect("cancels");
+                    }
+                }
+                received_count
+            })
+        };
+        lane.pass().await;
+        drop(lane);
+        let received_count = processor.await.expect("processor task");
+        assert!(received_count >= CANCEL_AFTER_COUNT);
+        assert!(
+            received_count < JOB_RECHECK_FETCH_COUNT as usize,
+            "sent {received_count} blocks after the cancel"
+        );
+        assert_eq!(
+            blocked_reason(&database, job_id).await.as_deref(),
+            Some("cancelled")
         );
     }
 

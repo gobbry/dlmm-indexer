@@ -33,25 +33,26 @@ SELECT least(min(start_slot), $1 + 1),
 FROM touching
 "#;
 
-// Holes are the gaps between consecutive ranges; history below the lowest range is owed only
-// when a backfill job for it was inserted (insert_backfill_job). A hole any uncompleted job overlaps is already owned, blocked jobs included:
-// a second job could not fetch what the first could not (an unmappable block instead splits
-// its job when it blocks, see jobs.rs). A hole's end is a block (the parent of the first block
-// of the range above); its start may be a skipped slot, which the filler's first-block rule
-// accepts. A hole is cut after `$1 - 1` and after `$2`, the archive window's bottom and top,
-// so no job is ever half archive, half provider. `$2` is a block, so the archive piece ends on
-// one; `$1 - 1` may be skipped, so a piece ending there is recorded as an archive_lower_cut,
-// and its lane waits for the archive's first block above it to prove that tail, wherever the
-// archive's bottom later moves. The update cannot see the jobs this statement inserts, and
-// none of them is covered anyway. `@>` is the constraint's range expression, so the
-// completion check probes coverage's GiST index rather than scanning it per job.
+// Holes are the gaps between consecutive ranges; history below the lowest range is owed only when a
+// backfill job for it was inserted (insert_backfill_job). A hole any uncompleted job overlaps is
+// already owned, blocked jobs included: a second job could not fetch what the first could not (an
+// unmappable block instead splits its job when it blocks, see jobs.rs). A hole's end is a block
+// (the parent of the first block of the range above); its start may be a skipped slot, which the
+// filler's first-block rule accepts. A hole is cut after `$1 - 1` and after `$2`, the archive
+// window's bottom and top, so no job is ever half archive, half provider. `$2` is a block, so the
+// archive piece ends on one; `$1 - 1` may be skipped, so a piece ending there is recorded as an
+// archive_lower_cut, and its lane waits for the archive's first block above it to prove that tail,
+// wherever the archive's bottom later moves. The update cannot see the jobs this statement inserts,
+// and none of them is covered anyway. `@>` is the constraint's range expression, so the completion
+// check probes coverage's GiST index rather than scanning it per job.
 //
 // A job opened uncut (a backfill the API inserted, or any job a window that appeared or moved
-// now straddles) is cut by the same pieces, as long as no block of it has committed: its last
-// piece keeps the job's own end_kind, and the job is replaced by its pieces. A job already
-// walking keeps its lane, whose parent chain vouches for the rest of it. The insert reads the
-// delete's output, so the job is gone before the exclusion constraint checks its pieces; the
-// completion update skips it, since one statement may not touch a row twice.
+// now straddles) is cut by the same pieces, as long as no block of it has committed. The job
+// keeps its id and end_kind and shrinks to its last piece, so the id a requester was given
+// still cancels the newest history; the other pieces are new jobs. A job already walking
+// keeps its lane, whose parent chain vouches for the rest of it. The insert reads the
+// update's output, so the job has shrunk before the exclusion constraint checks the other
+// pieces; the completion update skips it, since one statement may not touch a row twice.
 const RECONCILE_SQL: &str = r#"
 WITH ranges AS (
     SELECT start_slot, lag(end_slot) OVER (ORDER BY start_slot) AS previous_end_slot
@@ -115,24 +116,30 @@ opened AS (
     SELECT start_slot, end_slot, start_slot, end_kind FROM unowned ORDER BY end_slot DESC
     RETURNING id
 ),
-split_deleted AS (
-    DELETE FROM slot_range_job j
-    USING splittable s
+split_updated AS (
+    UPDATE slot_range_job j
+    SET start_slot = p.start_slot, next_slot = p.start_slot, updated_at = now()
+    FROM splittable s JOIN pieces p ON p.job_id = s.id AND p.end_slot = s.end_slot
     WHERE j.id = s.id
       AND j.completed_at IS NULL AND j.blocked_reason IS NULL AND j.next_slot = j.start_slot
-    RETURNING j.id, j.start_slot, j.end_slot
+    RETURNING j.id, s.start_slot AS span_start_slot, j.start_slot, j.end_slot,
+              j.end_kind
 ),
 split_inserted AS (
     INSERT INTO slot_range_job (start_slot, end_slot, next_slot, end_kind)
     SELECT p.start_slot, p.end_slot, p.start_slot, p.end_kind
-    FROM pieces p JOIN split_deleted d ON d.id = p.job_id
+    FROM pieces p JOIN split_updated u ON u.id = p.job_id
+    WHERE p.end_slot < u.start_slot
     ORDER BY p.end_slot DESC
     RETURNING id, start_slot, end_slot, end_kind
 ),
 split_pieces AS (
-    SELECT d.id AS split_job_id, i.id, i.start_slot, i.end_slot, i.end_kind
+    SELECT u.id AS split_job_id, u.id, u.start_slot, u.end_slot, u.end_kind
+    FROM split_updated u
+    UNION ALL
+    SELECT u.id, i.id, i.start_slot, i.end_slot, i.end_kind
     FROM split_inserted i
-    JOIN split_deleted d ON i.start_slot BETWEEN d.start_slot AND d.end_slot
+    JOIN split_updated u ON i.start_slot BETWEEN u.span_start_slot AND u.end_slot
 ),
 completed AS (
     UPDATE slot_range_job j
@@ -572,18 +579,27 @@ mod tests {
         connection: &mut PgConnection,
         (start_slot, end_slot, next_slot): (i64, i64, i64),
         end_kind: JobEndKind,
-    ) {
-        sqlx::query(
+    ) -> i64 {
+        sqlx::query_scalar(
             "INSERT INTO slot_range_job (start_slot, end_slot, next_slot, end_kind)
-             VALUES ($1, $2, $3, $4::job_end_kind)",
+             VALUES ($1, $2, $3, $4::job_end_kind)
+             RETURNING id",
         )
         .bind(start_slot)
         .bind(end_slot)
         .bind(next_slot)
         .bind(end_kind.as_str())
-        .execute(connection)
+        .fetch_one(connection)
         .await
-        .expect("seeds job");
+        .expect("seeds job")
+    }
+
+    // (id, start_slot, end_slot) of every job, in start order.
+    async fn job_ids(connection: &mut PgConnection) -> Vec<(i64, i64, i64)> {
+        sqlx::query_as("SELECT id, start_slot, end_slot FROM slot_range_job ORDER BY start_slot")
+            .fetch_all(connection)
+            .await
+            .expect("jobs")
     }
 
     fn split_ranges(summary: &ReconcileSummary) -> Vec<(u64, u64, JobEndKind)> {
@@ -598,14 +614,14 @@ mod tests {
             .collect()
     }
 
-    // An unstarted job (a backfill inserted uncut) straddling both window edges is replaced by
-    // the three pieces a hole would have been cut into, within the exclusion constraint; the
-    // next tick finds nothing left to split.
+    // An unstarted job (a backfill inserted uncut) straddling both window edges is cut into
+    // the three pieces a hole would have been, within the exclusion constraint; the job keeps
+    // its id on the piece nearest the tip, and the next tick finds nothing left to split.
     #[sqlx::test(migrations = "../migrations")]
     async fn reconcile_splits_an_unstarted_job_around_the_whole_archive_window(database: PgPool) {
         let mut connection = database.acquire().await.expect("connection");
         seed_range(&mut connection, 1_000, 1_099).await;
-        seed_walked_job(&mut connection, (100, 999, 100), JobEndKind::Block).await;
+        let job_id = seed_walked_job(&mut connection, (100, 999, 100), JobEndKind::Block).await;
 
         let summary = reconcile(&mut connection, window(300, 600))
             .await
@@ -625,6 +641,19 @@ mod tests {
                 (601, 999, JobEndKind::Block),
             ]
         );
+        let ids = job_ids(&mut connection).await;
+        assert_eq!(ids[2], (job_id, 601, 999));
+        assert!(ids[..2].iter().all(|&(id, ..)| id > job_id));
+        let split_ids: Vec<i64> = summary.splits[0]
+            .pieces
+            .iter()
+            .map(|piece| piece.id.get())
+            .collect();
+        assert_eq!(
+            split_ids,
+            ids.iter().map(|&(id, ..)| id).collect::<Vec<_>>()
+        );
+        assert_eq!(summary.splits[0].job_id.get(), job_id);
 
         let again = reconcile(&mut connection, window(300, 600))
             .await
@@ -633,13 +662,13 @@ mod tests {
         assert_eq!(cut_jobs(&mut connection).await, expected);
     }
 
-    // A job cut below an earlier bottom keeps its cut end when the bottom moves down into it:
-    // only the new piece below the new bottom gets a cut of its own.
+    // A job cut below an earlier bottom keeps its id and cut end when the bottom moves down
+    // into it: only the new piece below the new bottom gets a cut of its own.
     #[sqlx::test(migrations = "../migrations")]
     async fn reconcile_split_keeps_the_job_end_kind_on_its_last_piece(database: PgPool) {
         let mut connection = database.acquire().await.expect("connection");
         seed_range(&mut connection, 1_000, 1_099).await;
-        seed_walked_job(
+        let job_id = seed_walked_job(
             &mut connection,
             (100, 149, 100),
             JobEndKind::ArchiveLowerCut,
@@ -658,6 +687,7 @@ mod tests {
                 cut_job(150, 999, JobEndKind::Block),
             ]
         );
+        assert_eq!(job_ids(&mut connection).await[1], (job_id, 120, 149));
     }
 
     // A job with a committed block keeps its range and lane even though it straddles the
@@ -679,12 +709,12 @@ mod tests {
     }
 
     // Without a window there is nothing to cut at, so an unstarted job stays whole; the first
-    // tick that knows the window splits it.
+    // tick that knows the window splits it, and the job's id stays on the piece above the top.
     #[sqlx::test(migrations = "../migrations")]
     async fn reconcile_splits_a_job_once_the_window_is_known(database: PgPool) {
         let mut connection = database.acquire().await.expect("connection");
         seed_range(&mut connection, 1_000, 1_099).await;
-        seed_walked_job(&mut connection, (100, 999, 100), JobEndKind::Block).await;
+        let job_id = seed_walked_job(&mut connection, (100, 999, 100), JobEndKind::Block).await;
 
         let unknown = reconcile(&mut connection, None).await.expect("reconciles");
         assert_eq!(unknown, ReconcileSummary::default());
@@ -703,6 +733,7 @@ mod tests {
                 cut_job(601, 999, JobEndKind::Block),
             ]
         );
+        assert_eq!(job_ids(&mut connection).await[1], (job_id, 601, 999));
     }
 
     // Two jobs may never claim the same slot, even at a shared end.

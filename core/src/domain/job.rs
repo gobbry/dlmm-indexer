@@ -1,4 +1,4 @@
-use crate::domain::ids::{JobId, Slot, SlotRange};
+use crate::domain::ids::{JobId, Slot, SlotRange, UnixSeconds};
 
 // next_slot passing range.end_inclusive only means the walk is done; the job is complete once
 // the reconciler finds its range inside one coverage range.
@@ -39,7 +39,8 @@ pub struct ReconcileSummary {
     pub splits: Vec<JobSplit>,
 }
 
-// An unstarted job that straddled an archive window edge, replaced by its pieces in start order.
+// An unstarted job that straddled an archive window edge, cut into pieces in start order; the
+// last piece keeps the job's id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSplit {
     pub job_id: JobId,
@@ -53,7 +54,6 @@ pub struct JobPiece {
     pub end_kind: JobEndKind,
 }
 
-// What inserting a backfill job from a resolved slot came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackfillInsert {
     Inserted { id: JobId, range: SlotRange },
@@ -63,6 +63,53 @@ pub enum BackfillInsert {
     FromAtOrAboveCoverage { lowest_coverage_start: Slot },
     // Another job (open, blocked or completed) already owns part of the range.
     OverlapsJob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedReason(String);
+
+impl BlockedReason {
+    pub const CANCELLED_TEXT: &'static str = "cancelled";
+
+    pub fn new(text: String) -> Self {
+        debug_assert!(!text.is_empty());
+        Self(text)
+    }
+
+    pub fn cancelled() -> Self {
+        Self(Self::CANCELLED_TEXT.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0 == Self::CANCELLED_TEXT
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobListing {
+    pub id: JobId,
+    pub range: SlotRange,
+    pub next_slot: Slot,
+    pub end_kind: JobEndKind,
+    pub blocked_reason: Option<BlockedReason>,
+    pub completed_at: Option<UnixSeconds>,
+    pub created_at: UnixSeconds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Cancelled {
+        id: JobId,
+        range: SlotRange,
+        next_slot: Slot,
+    },
+    NotFound,
+    AlreadyCompleted,
+    AlreadyBlocked(BlockedReason),
 }
 
 // The slots the archive lane fills: from the archive's first available slot up to `top`, a

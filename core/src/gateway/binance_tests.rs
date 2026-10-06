@@ -50,7 +50,6 @@ fn recorded_klines_parse_to_closed_candles_only() {
     assert!(points.iter().all(|point| point.asset == QuoteAsset::Sol));
 }
 
-// Once the last candle's close time has passed it is returned too.
 #[test]
 fn recorded_klines_include_last_candle_after_it_closes() {
     let points = parse_klines(
@@ -61,7 +60,6 @@ fn recorded_klines_include_last_candle_after_it_closes() {
     assert_eq!(points.unwrap().len(), 5);
 }
 
-// A candle whose open time is not on a minute boundary is rejected, never stored.
 #[test]
 fn kline_off_minute_boundary_is_malformed() {
     let body = br#"[[1790982420001,"1","1","1","1","0",1790982479999,"0",0,"0","0","0"]]"#;

@@ -109,7 +109,6 @@ fn assert_swap(swap: &DecodedSwap, expected: &Expected) {
     );
 }
 
-// A top-level swap2 decodes to one swap.
 #[test]
 fn direct_swap2_decodes_one_swap() {
     let decoded = decode_fixture("direct_swap2");
@@ -302,7 +301,7 @@ fn map_rpc_block_rejects_version_above_ceiling() {
 #[test]
 fn swap_event_without_known_swap_instruction_is_a_failure() {
     // The direct fixture's top-level call.
-    const SWAP2_DISCRIMINATOR: Discriminator = Discriminator::hex("414b3f4ceb5b5b88"); // swap2
+    const SWAP2_DISCRIMINATOR: Discriminator = Discriminator::hex("414b3f4ceb5b5b88");
     let mut transaction = map_fixture("direct_swap2").expect("not failed");
     let swap2 = transaction
         .instructions

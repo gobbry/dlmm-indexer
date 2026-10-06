@@ -255,7 +255,6 @@ mod tests {
         }
     }
 
-    // Each Swap2Evt field is read from its own 0.12.0 offset.
     #[test]
     fn swap2_event_reads_every_field_at_its_offset() {
         let decoded = decode_swap2_event(&swap2_payload(), &matching_swap());
@@ -312,7 +311,6 @@ mod tests {
         }
     }
 
-    // Any other layout is left undecoded rather than misread.
     #[test]
     fn swap2_event_of_another_length_is_not_decoded() {
         let longer = [0_u8; SWAP2_EVENT_LENGTH_BYTES + 8];
@@ -332,7 +330,6 @@ mod tests {
         );
     }
 
-    // An event tag with no room for a discriminator is a typed error.
     #[test]
     fn split_event_rejects_truncated_header() {
         assert_eq!(

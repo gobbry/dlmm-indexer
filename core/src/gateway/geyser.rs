@@ -8,6 +8,7 @@ use futures::{SinkExt, StreamExt};
 use reqwest::Url;
 use thiserror::Error;
 use tonic::Code;
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::AsciiMetadataValue;
 use yellowstone_grpc_client::{
     ClientTlsConfig, GeyserGrpcBuilderError, GeyserGrpcClient, GeyserGrpcClientError,
@@ -28,9 +29,10 @@ use crate::domain::error::{AddressParseError, DecodeError, MapError};
 use crate::domain::ids::{AccountAddress, Signature, Slot, TransactionIndex, UnixSeconds};
 use crate::domain::swap::DecodeFailure;
 
-// No server-side chunking: a whole block is one message, far above tonic's 4 MiB default.
-// The filter keeps only DLMM transactions, so 64 MiB is generous where upstream's 1 GiB
-// example would let one bad message claim a gigabyte.
+// No server-side chunking: a whole block is one message, above tonic's 4 MiB default. The
+// filter keeps only DLMM-referencing transactions (1 to 4 MiB a block measured on mainnet,
+// decompressed), so 64 MiB is generous where upstream's 1 GiB example would let one bad
+// message claim a gigabyte.
 const MAX_DECODING_MESSAGE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // Subscribing waits for response headers; a server that accepts TCP and never answers must
@@ -233,6 +235,10 @@ impl GeyserStream<Disconnected> {
         let mut builder = GeyserGrpcClient::build_from_shared(gateway.endpoint.to_string())?
             .x_token(gateway.x_token.clone().map(|token| token.0))?
             .connect_timeout(CONNECT_TIMEOUT)
+            // Most DLMM-referencing transactions are bot traffic with large token-balance
+            // tables that no server filter can drop; zstd cuts them about 8x on the wire.
+            // A server without zstd answers uncompressed, so this never fails a subscription.
+            .accept_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE_BYTES);
         if gateway.transport == Transport::Tls {
             builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
@@ -265,7 +271,6 @@ impl GeyserStream<Connected> {
     }
 }
 
-// What one server message turned out to be.
 #[derive(Debug)]
 pub enum GeyserUpdate {
     Block(FinalizedBlock),

@@ -2,8 +2,8 @@ use rust_decimal::Decimal;
 use sqlx::{PgConnection, PgPool};
 
 use super::{
-    RebuildStart, read_health, read_pool_metadata, read_pool_volume, read_pools,
-    read_projection_states, read_recent_swaps, read_unpriced_minute_range, rebuild_projection,
+    RebuildStart, read_health, read_pool_metadata, read_pool_summary, read_pool_volume, read_pools,
+    read_projection_states, read_swaps, read_unpriced_minute_range, rebuild_projection,
     reprice_unpriced, write_block, write_prices,
 };
 use crate::domain::amounts::{
@@ -17,7 +17,7 @@ use crate::domain::ids::{
 };
 use crate::domain::price::{PricePoint, PriceSource, UnpriceableMinute};
 use crate::domain::projection::{ProjectionName, ProjectionState};
-use crate::domain::query::{AlignedRange, Bucket, ProjectionRead, RowCountMax};
+use crate::domain::query::{AlignedRange, Bucket, PageLimit, PageOffset, ProjectionRead};
 use crate::domain::registry::PoolRecord;
 use crate::domain::swap::{
     DecodeFailure, DecodedSwap, EnrichedSwap, FeeSide, FeeToken, Swap2Event, SwapDirection,
@@ -603,10 +603,15 @@ async fn projection_reads_report_rebuilding_tables(database: PgPool) {
         .expect("pool")
         .expect("known pool");
     assert_eq!(metadata.first_swap_at, None);
-    let pools = read_pools(&database, RowCountMax::new(10))
+    let pools = read_pools(&database, PageLimit::DEFAULT, PageOffset::default())
         .await
         .expect("pools");
     assert_eq!(pools, ProjectionRead::Rebuilding(ProjectionName::PoolStats));
+    let summary = read_pool_summary(&database, pool).await.expect("summary");
+    assert_eq!(
+        summary,
+        ProjectionRead::Rebuilding(ProjectionName::PoolStats)
+    );
     let health = read_health(&database).await.expect("health");
     assert_eq!(
         health.rebuilding_projections,
@@ -687,10 +692,10 @@ async fn read_pool_volume_fills_empty_buckets_and_sums_days(database: PgPool) {
     assert_eq!(daily[0].volume_usd, Some(Decimal::from(301)));
 }
 
-// Recent swaps come newest first; the pool's metadata carries its first swap, and its
-// summary in the pool list carries the last.
+// Swaps come newest first; the pool's metadata carries its first swap, and its summary, alone
+// and in the pool list, carries the last.
 #[sqlx::test(migrations = "../migrations")]
-async fn read_recent_swaps_and_pool_summary(database: PgPool) {
+async fn read_swaps_and_pool_summary(database: PgPool) {
     let mut connection = database.acquire().await.expect("connection");
     write(&mut connection, two_swap_block(), LIVE).await;
     let later_swap = swap(priced_pool(), 4, SwapDirection::YToX, 600, 1_000);
@@ -703,9 +708,31 @@ async fn read_recent_swaps_and_pool_summary(database: PgPool) {
     write(&mut connection, later, LIVE).await;
     let pool = priced_pool().address;
 
-    let swaps = read_recent_swaps(&database, pool, RowCountMax::new(10))
+    let metadata = read_pool_metadata(&database, pool)
         .await
-        .expect("swaps");
+        .expect("pool")
+        .expect("known pool");
+    assert_eq!(metadata.mint_x, sol_mint());
+    assert_eq!(metadata.first_swap_at, Some(UnixSeconds::new(BLOCK_TIME)));
+
+    assert_eq!(
+        metadata.last_swap_at,
+        Some(UnixSeconds::new(BLOCK_TIME + 60))
+    );
+
+    // The first and last swaps bound the scan and are themselves on the page.
+    let page = read_swaps(
+        &database,
+        pool,
+        metadata.first_swap_at,
+        metadata.last_swap_at,
+        PageLimit::DEFAULT,
+        None,
+    )
+    .await
+    .expect("swaps");
+    assert_eq!(page.next_cursor, None);
+    let swaps = page.swaps;
     let signatures: Vec<Signature> = swaps.iter().map(|row| row.signature).collect();
     assert_eq!(
         signatures,
@@ -714,24 +741,21 @@ async fn read_recent_swaps_and_pool_summary(database: PgPool) {
     assert_eq!(swaps[1].amount_in, TokenAmountRaw::new(2_000_000_000));
     assert_eq!(swaps[1].quote_asset, Some(QuoteAsset::Sol));
 
-    let metadata = read_pool_metadata(&database, pool)
-        .await
-        .expect("pool")
-        .expect("known pool");
-    assert_eq!(metadata.mint_x, sol_mint());
-    assert_eq!(metadata.first_swap_at, Some(UnixSeconds::new(BLOCK_TIME)));
-    let pools = read_pools(&database, RowCountMax::new(10))
+    let pools = read_pools(&database, PageLimit::DEFAULT, PageOffset::default())
         .await
         .map(live)
         .expect("pools");
-    let summary = pools
+    let listed = pools
+        .pools
         .iter()
         .find(|summary| summary.address == pool)
         .expect("listed pool");
-    assert_eq!(
-        summary.last_swap_at,
-        Some(UnixSeconds::new(BLOCK_TIME + 60))
-    );
+    assert_eq!(listed.last_swap_at, Some(UnixSeconds::new(BLOCK_TIME + 60)));
+    let alone = read_pool_summary(&database, pool)
+        .await
+        .map(live)
+        .expect("summary");
+    assert_eq!(alone.as_ref(), Some(listed));
     let unknown = read_pool_metadata(&database, PoolAddress::new([99; 32]))
         .await
         .expect("pool");

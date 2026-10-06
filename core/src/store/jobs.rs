@@ -5,10 +5,16 @@
 use sqlx::postgres::PgRow;
 use sqlx::{PgExecutor, PgPool, Row};
 
-use super::convert::{job_end_kind_from_database, slot_from_database, slot_to_database};
+use chrono::{DateTime, Utc};
+
+use super::convert::{
+    job_end_kind_from_database, slot_from_database, slot_to_database, unix_from_timestamp,
+};
 use crate::domain::error::StoreError;
 use crate::domain::ids::{JobId, Slot, SlotRange};
-use crate::domain::job::{ArchiveWindow, BackfillInsert, SlotRangeJob};
+use crate::domain::job::{
+    ArchiveWindow, BackfillInsert, BlockedReason, CancelOutcome, JobListing, SlotRangeJob,
+};
 use crate::domain::query::RowCountMax;
 
 // Why a job stopped; the operator reads the text and clears the column once it is resolved.
@@ -31,6 +37,15 @@ pub(crate) enum JobBlock {
 }
 
 impl JobBlock {
+    fn slot(self) -> Slot {
+        match self {
+            Self::MissingInStorage(slot)
+            | Self::Unmappable(slot)
+            | Self::EndUnproven(slot)
+            | Self::ArchiveUnavailable(slot) => slot,
+        }
+    }
+
     fn reason_text(self) -> String {
         match self {
             Self::MissingInStorage(slot) => format!("missing_in_storage:{}", slot.get()),
@@ -133,10 +148,43 @@ pub(crate) async fn read_block_above_stuck(
     Ok(stuck)
 }
 
+// Whether a walk may go on sending blocks for this job. Closed covers a job blocked (an
+// operator's cancel included), completed or deleted since the pass read it, and one the
+// reconciler split in place: the row keeps its id but now starts above the slots the walk
+// is fetching, which belong to a new job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobWalkState {
+    Open,
+    Closed,
+}
+
+// One primary-key probe, so a walk can afford it every few dozen blocks.
+pub(crate) async fn read_job_walk_state(
+    database: &PgPool,
+    job_id: JobId,
+    walked_start: Slot,
+) -> Result<JobWalkState, StoreError> {
+    let open: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM slot_range_job
+                        WHERE id = $1 AND start_slot = $2
+                          AND completed_at IS NULL AND blocked_reason IS NULL)",
+    )
+    .bind(job_id.get())
+    .bind(slot_to_database(walked_start, "walked_start")?)
+    .fetch_one(database)
+    .await?;
+    Ok(if open {
+        JobWalkState::Open
+    } else {
+        JobWalkState::Closed
+    })
+}
+
 // An unmappable block is a property of that one slot, so the job ends there (the block is a
 // slot of the chain, so the job now ends on a block) and the slots after it become a fresh
 // job in the same transaction, keeping the old end and how it was set; any other block stops
-// the whole job.
+// the whole job. A block below the row's start comes from a walk that read the job before the
+// reconciler split it in place, so it names a slot the row no longer owns and changes nothing.
 pub(crate) async fn block_job(
     database: &PgPool,
     job_id: JobId,
@@ -154,12 +202,13 @@ pub(crate) async fn block_job(
              end_kind = CASE WHEN $3 < j.end_slot THEN 'block' ELSE j.end_kind END,
              updated_at = now()
          FROM (SELECT end_slot, end_kind FROM slot_range_job WHERE id = $1) old
-         WHERE j.id = $1
+         WHERE j.id = $1 AND j.blocked_reason IS NULL AND j.start_slot <= $4
          RETURNING old.end_slot, old.end_kind::text",
     )
     .bind(job_id.get())
     .bind(block.reason_text())
     .bind(cut_slot)
+    .bind(slot_to_database(block.slot(), "blocked_slot")?)
     .fetch_optional(&mut *transaction)
     .await?;
     if let (Some(cut_slot), Some((old_end_slot, old_end_kind))) = (cut_slot, old_end)
@@ -248,6 +297,132 @@ pub async fn insert_backfill_job<'executor>(
     }
 }
 
+// Cancelling is blocking with reason `cancelled`: a blocked job owns its hole, so the
+// reconciler reopens nothing over it and the filler skips it. Deleting the row instead would
+// hand the hole straight back to the reconciler. The target is locked first, so the reason a
+// refusal reports is the row the update saw.
+const CANCEL_JOB_SQL: &str = r#"
+WITH target AS (
+    SELECT id, completed_at IS NOT NULL AS completed, blocked_reason
+    FROM slot_range_job
+    WHERE id = $1
+    FOR UPDATE
+),
+cancelled AS (
+    UPDATE slot_range_job j
+    SET blocked_reason = $2, updated_at = now()
+    FROM target t
+    WHERE j.id = t.id AND NOT t.completed AND t.blocked_reason IS NULL
+    RETURNING j.start_slot, j.end_slot, j.next_slot
+)
+SELECT t.completed, t.blocked_reason, c.start_slot, c.end_slot, c.next_slot
+FROM target t
+LEFT JOIN cancelled c ON true
+"#;
+
+type CancelRow = (bool, Option<String>, Option<i64>, Option<i64>, Option<i64>);
+
+pub async fn cancel_job<'executor>(
+    executor: impl PgExecutor<'executor>,
+    job_id: JobId,
+) -> Result<CancelOutcome, StoreError> {
+    let row: Option<CancelRow> = sqlx::query_as(CANCEL_JOB_SQL)
+        .bind(job_id.get())
+        .bind(BlockedReason::CANCELLED_TEXT)
+        .fetch_optional(executor)
+        .await?;
+    let Some((completed, blocked_reason, start_slot, end_slot, next_slot)) = row else {
+        return Ok(CancelOutcome::NotFound);
+    };
+    match (start_slot, end_slot, next_slot) {
+        (Some(start_slot), Some(end_slot), Some(next_slot)) => {
+            debug_assert!(!completed);
+            debug_assert!(blocked_reason.is_none());
+            Ok(CancelOutcome::Cancelled {
+                id: job_id,
+                range: SlotRange {
+                    start: slot_from_database(start_slot, "slot_range_job.start_slot")?,
+                    end_inclusive: slot_from_database(end_slot, "slot_range_job.end_slot")?,
+                },
+                next_slot: slot_from_database(next_slot, "slot_range_job.next_slot")?,
+            })
+        }
+        _ if completed => Ok(CancelOutcome::AlreadyCompleted),
+        _ => blocked_reason
+            .map(|reason| CancelOutcome::AlreadyBlocked(BlockedReason::new(reason)))
+            .ok_or(StoreError::ValueOutOfRange {
+                column: "slot_range_job.blocked_reason",
+            }),
+    }
+}
+
+// One column list for the list and for one job, so both read the same columns the same way.
+macro_rules! read_jobs_sql {
+    ($filter:literal) => {
+        concat!(
+            "SELECT id, start_slot, end_slot, next_slot, end_kind::text AS end_kind,
+       blocked_reason, completed_at, created_at
+FROM slot_range_job ",
+            $filter
+        )
+    };
+}
+
+// slot_range_job_newest serves the order, so the list stops after its page.
+const READ_JOBS_SQL: &str = read_jobs_sql!("ORDER BY created_at DESC, id DESC LIMIT $1");
+
+// Its own statement, so a cached generic plan is always the primary-key lookup.
+const READ_JOB_SQL: &str = read_jobs_sql!("WHERE id = $1");
+
+// Newest first: the job a person just asked for, or just cancelled, is at the top.
+pub async fn read_jobs<'executor>(
+    executor: impl PgExecutor<'executor>,
+    job_count_max: RowCountMax,
+) -> Result<Vec<JobListing>, StoreError> {
+    debug_assert!(job_count_max.get() > 0);
+    let rows = sqlx::query(READ_JOBS_SQL)
+        .bind(i64::from(job_count_max.get()))
+        .fetch_all(executor)
+        .await?;
+    let jobs = rows
+        .iter()
+        .map(job_listing_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    debug_assert!(jobs.len() <= job_count_max.get() as usize);
+    Ok(jobs)
+}
+
+pub async fn read_job<'executor>(
+    executor: impl PgExecutor<'executor>,
+    job_id: JobId,
+) -> Result<Option<JobListing>, StoreError> {
+    let row = sqlx::query(READ_JOB_SQL)
+        .bind(job_id.get())
+        .fetch_optional(executor)
+        .await?;
+    let job = row.as_ref().map(job_listing_from_row).transpose()?;
+    debug_assert!(job.as_ref().is_none_or(|job| job.id == job_id));
+    Ok(job)
+}
+
+fn job_listing_from_row(row: &PgRow) -> Result<JobListing, StoreError> {
+    let blocked_reason: Option<String> = row.try_get("blocked_reason")?;
+    let completed_at: Option<DateTime<Utc>> = row.try_get("completed_at")?;
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    Ok(JobListing {
+        id: JobId::new(row.try_get("id")?),
+        range: SlotRange {
+            start: slot_from_database(row.try_get("start_slot")?, "start_slot")?,
+            end_inclusive: slot_from_database(row.try_get("end_slot")?, "end_slot")?,
+        },
+        next_slot: slot_from_database(row.try_get("next_slot")?, "next_slot")?,
+        end_kind: job_end_kind_from_database(row.try_get("end_kind")?)?,
+        blocked_reason: blocked_reason.map(BlockedReason::new),
+        completed_at: completed_at.map(unix_from_timestamp),
+        created_at: unix_from_timestamp(created_at),
+    })
+}
+
 // exclusion_violation: the range overlaps a job, open, blocked or completed.
 fn is_exclusion_violation(error: &sqlx::Error) -> bool {
     error
@@ -261,6 +436,10 @@ mod tests {
     use super::*;
     use crate::domain::job::JobEndKind;
     use crate::store::reconcile;
+
+    fn reason(text: &str) -> BlockedReason {
+        BlockedReason::new(text.to_owned())
+    }
 
     async fn insert_job(database: &PgPool, start_slot: i64, next_slot: i64) -> JobId {
         let id: i64 = sqlx::query_scalar(
@@ -450,6 +629,133 @@ mod tests {
             .await
             .expect("reads");
         assert_eq!(open[0].end_kind, JobEndKind::ArchiveLowerCut);
+    }
+
+    // A walk that read the job before the reconciler split it in place is fetching slots the
+    // row no longer owns: the walk is told to stop, and an unmappable block it meets there
+    // leaves the surviving piece untouched rather than blocking it on a slot below its start.
+    #[sqlx::test(migrations = "../migrations")]
+    async fn walk_read_before_an_in_place_split_neither_continues_nor_blocks(database: PgPool) {
+        let job = insert_job(&database, 100, 100).await;
+        let window = ArchiveWindow::new(Slot::new(50), Slot::new(150)).expect("window");
+        let mut connection = database.acquire().await.expect("connection");
+        reconcile(&mut connection, Some(window))
+            .await
+            .expect("splits at the window top");
+        let split_rows = vec![(100, 150, 100, None), (151, 199, 151, None)];
+        assert_eq!(job_rows(&database).await, split_rows);
+
+        let walk_state = read_job_walk_state(&database, job, Slot::new(100))
+            .await
+            .expect("reads");
+        assert_eq!(walk_state, JobWalkState::Closed);
+        block_job(&database, job, JobBlock::Unmappable(Slot::new(120)))
+            .await
+            .expect("a stale block is not an error");
+        assert_eq!(job_rows(&database).await, split_rows);
+    }
+
+    // Only an uncompleted, unblocked job is cancelled; a completed one, an already blocked one
+    // (a cancel included) and an unknown id are refused without touching the row.
+    #[sqlx::test(migrations = "../migrations")]
+    async fn cancel_job_blocks_only_an_open_job(database: PgPool) {
+        let open = insert_job(&database, 100, 150).await;
+        let completed = insert_job(&database, 300, 300).await;
+        let blocked = insert_job(&database, 500, 500).await;
+        sqlx::query("UPDATE slot_range_job SET completed_at = now() WHERE id = $1")
+            .bind(completed.get())
+            .execute(&database)
+            .await
+            .expect("completes");
+        block_job(
+            &database,
+            blocked,
+            JobBlock::MissingInStorage(Slot::new(510)),
+        )
+        .await
+        .expect("blocks");
+
+        assert_eq!(
+            cancel_job(&database, open).await.expect("cancels"),
+            CancelOutcome::Cancelled {
+                id: open,
+                range: SlotRange {
+                    start: Slot::new(100),
+                    end_inclusive: Slot::new(199),
+                },
+                next_slot: Slot::new(150),
+            }
+        );
+        assert_eq!(
+            cancel_job(&database, open).await.expect("cancels"),
+            CancelOutcome::AlreadyBlocked(reason("cancelled"))
+        );
+        assert_eq!(
+            cancel_job(&database, completed).await.expect("cancels"),
+            CancelOutcome::AlreadyCompleted
+        );
+        assert_eq!(
+            cancel_job(&database, blocked).await.expect("cancels"),
+            CancelOutcome::AlreadyBlocked(reason("missing_in_storage:510"))
+        );
+        assert_eq!(
+            cancel_job(&database, JobId::new(999))
+                .await
+                .expect("cancels"),
+            CancelOutcome::NotFound
+        );
+        assert_eq!(
+            job_rows(&database).await,
+            vec![
+                (100, 199, 150, Some("cancelled".to_owned())),
+                (300, 399, 300, None),
+                (500, 599, 500, Some("missing_in_storage:510".to_owned())),
+            ]
+        );
+    }
+
+    // The live failure this guards: a cancelled walk leaves a stub of coverage below the range
+    // above, and the hole between them must stay the cancelled job's, even when a walk that
+    // read the job open before the cancel then blocks it. Deleting the cancelled row is the
+    // resume: the next reconcile reopens the rest of the hole.
+    #[sqlx::test(migrations = "../migrations")]
+    async fn cancelled_job_owns_its_hole_until_its_row_is_deleted(database: PgPool) {
+        sqlx::query(
+            "INSERT INTO slot_coverage (start_slot, end_slot, end_block_time)
+             VALUES (100, 150, now()), (400, 499, now())",
+        )
+        .execute(&database)
+        .await
+        .expect("seeds coverage");
+        let job = JobId::new(
+            sqlx::query_scalar(
+                "INSERT INTO slot_range_job (start_slot, end_slot, next_slot)
+                 VALUES (100, 399, 151) RETURNING id",
+            )
+            .fetch_one(&database)
+            .await
+            .expect("job inserts"),
+        );
+        cancel_job(&database, job).await.expect("cancels");
+        block_job(&database, job, JobBlock::MissingInStorage(Slot::new(160)))
+            .await
+            .expect("blocks");
+        let mut connection = database.acquire().await.expect("connection");
+        let summary = reconcile(&mut connection, None).await.expect("reconciles");
+        assert_eq!(summary.opened_job_count, 0);
+        assert_eq!(
+            job_rows(&database).await,
+            vec![(100, 399, 151, Some("cancelled".to_owned()))]
+        );
+
+        sqlx::query("DELETE FROM slot_range_job WHERE id = $1")
+            .bind(job.get())
+            .execute(&database)
+            .await
+            .expect("resumes");
+        let summary = reconcile(&mut connection, None).await.expect("reconciles");
+        assert_eq!(summary.opened_job_count, 1);
+        assert_eq!(job_rows(&database).await, vec![(151, 399, 151, None)]);
     }
 
     // A backfill job needs a range to end below, and a start below that range; it ends on the

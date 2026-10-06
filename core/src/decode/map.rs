@@ -31,7 +31,6 @@ pub fn map_rpc_transaction(
     let account_keys = account_key_table(transaction)
         .map(|key| key.parse::<AccountAddress>().map_err(MapError::AccountKey))
         .collect::<Result<Vec<_>, _>>()?;
-    // Instruction indexes are u8, so a larger table cannot be addressed consistently.
     if account_keys.len() > ACCOUNT_KEY_COUNT_MAX {
         return Err(MapError::AccountIndex(account_keys.len() as u64));
     }

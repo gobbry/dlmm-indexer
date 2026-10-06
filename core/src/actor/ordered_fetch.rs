@@ -122,11 +122,11 @@ pub(crate) trait ListedBlockHandler {
 }
 
 // The one RPC fetch shape behind the tail and the range filler: the caller lists a page with
-// getBlocks, and only the listed slots get a getBlock, handed over in slot order. A skipped
-// slot is never listed by a provider, so it costs no call and needs no message; the archive
-// lists every slot, and its skipped ones come back as errors the caller classifies. `stop` resolving drops the
-// fetch, which aborts the calls in flight; next() is cancel-safe because a joined result is
-// stored before it returns.
+// getBlocks, and only the listed slots get a getBlock, handed over in slot order. A skipped slot is
+// never listed by a provider, so it costs no call and needs no message; the archive lists every
+// slot, and its skipped ones come back as errors the caller classifies. `stop` resolving drops the
+// fetch, which aborts the calls in flight; next() is cancel-safe because a joined result is stored
+// before it returns.
 pub(crate) async fn fetch_listed<Handler: ListedBlockHandler>(
     gateway: &Arc<RpcGateway>,
     slots: Vec<Slot>,

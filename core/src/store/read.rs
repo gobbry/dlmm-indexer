@@ -10,16 +10,16 @@ use super::convert::{
     fee_token_from_database, optional_amount_from_database, projection_name_from_database,
     projection_state_from_database, quote_asset_from_database, slot_from_database,
     slot_to_database, swap_ordinal_from_database, swap_ordinal_to_database,
-    swap_source_from_database, timestamp_from_unix, transaction_index_to_database,
-    unix_from_timestamp,
+    swap_source_from_database, timestamp_from_unix, transaction_index_from_database,
+    transaction_index_to_database, unix_from_timestamp,
 };
 use super::write::inserted_swap_from_row;
 use crate::domain::error::StoreError;
 use crate::domain::ids::{JobId, PoolAddress, UnixSeconds};
 use crate::domain::projection::{InsertedSwap, LogPosition, ProjectionName, ProjectionState};
 use crate::domain::query::{
-    AlignedRange, Bucket, IndexerHealth, PoolMetadata, PoolSummary, ProjectionRead, RowCountMax,
-    SwapRow, VolumeBucket,
+    AlignedRange, Bucket, IndexerHealth, PageLimit, PageOffset, PoolMetadata, PoolPage,
+    PoolSummary, ProjectionRead, RowCountMax, SwapCursor, SwapPage, SwapRow, VolumeBucket,
 };
 
 const HOUR_SECONDS: i64 = 3_600;
@@ -74,14 +74,11 @@ ORDER BY slot, transaction_index, swap_ordinal
 LIMIT $4
 "#;
 
-// The 24-hour window is the current hour and the 23 before it. Both projections it reads
-// report their state from the same statement, for the reason given at pool_volume_sql.
+// The 24-hour window is the current hour and the 23 before it.
 macro_rules! pool_summary_sql {
     () => {
         r#"
-SELECT (SELECT state::text FROM projection WHERE name = 'pool_volume_1h') AS volume_1h_state,
-       (SELECT state::text FROM projection WHERE name = 'pool_stats')     AS stats_state,
-       p.address, p.mint_x, p.mint_y,
+SELECT p.address, p.mint_x, p.mint_y,
        token_x.decimals AS decimals_x, token_y.decimals AS decimals_y,
        coalesce(recent.swap_count, 0)::bigint          AS swap_count_24h,
        coalesce(recent.unpriced_swap_count, 0)::bigint AS unpriced_swap_count_24h,
@@ -102,12 +99,79 @@ LEFT JOIN (
     };
 }
 
+// Both projections a summary reads report their state from the same statement, for the reason
+// given at pool_volume_sql. The summaries hang off a one-row base by LEFT JOIN, so the states
+// (and the page's extra columns) come back even when the page or the pool is empty.
+macro_rules! pool_summary_states_sql {
+    ($extra_columns:literal) => {
+        concat!(
+            r#"
+SELECT (SELECT state::text FROM projection WHERE name = 'pool_volume_1h') AS volume_1h_state,
+       (SELECT state::text FROM projection WHERE name = 'pool_stats')     AS stats_state,
+       "#,
+            $extra_columns,
+            r#"
+       summary.*
+FROM (SELECT 1) AS one
+LEFT JOIN summary ON true
+"#
+        )
+    };
+}
+
+// The swap count breaks ties among unpriced pools, which all rank at zero USD.
+const POOL_PAGE_SQL: &str = concat!(
+    "WITH summary AS (",
+    pool_summary_sql!(),
+    "ORDER BY volume_usd_24h DESC, swap_count_24h DESC, p.address LIMIT $1 OFFSET $2)",
+    pool_summary_states_sql!("(SELECT count(*) FROM pool) AS pool_count,"),
+    "ORDER BY summary.volume_usd_24h DESC, summary.swap_count_24h DESC, summary.address"
+);
+
+const POOL_SUMMARY_SQL: &str = concat!(
+    "WITH summary AS (",
+    pool_summary_sql!(),
+    "WHERE p.address = $1)",
+    pool_summary_states_sql!("")
+);
+
+// Newest first by the full log key, so rows sharing a block_time (a slot, or two slots in one
+// second) have one order and a page boundary between them neither repeats nor skips a row.
+// The bare block_time bound duplicates the row comparison's leading column so the planner can
+// use it to bound the swap_pool_time scan and skip chunks. `$3` and `$4`, the pool's first and
+// last swaps, bound it on both sides, so a quiet pool or the last page does not probe every
+// older chunk, and a pool whose swaps are all old does not probe every newer one.
+macro_rules! swap_page_sql {
+    ($after:literal) => {
+        concat!(
+            "SELECT signature, swap_ordinal, slot, transaction_index, block_time, user_address,
+                    direction::text AS direction, mint_in, mint_out, amount_in, amount_out, fee,
+                    protocol_fee, host_fee, fee_rate_1e9, mm_fee, limit_order_fee, amount_left,
+                    fee_side::text AS fee_side, fee_token::text AS fee_token,
+                    quote_asset_symbol, volume_usd, source::text AS source, fill_job_id
+             FROM swap
+             WHERE pool = $1 AND block_time >= $3
+               AND block_time <= coalesce($4::timestamptz, 'infinity') ",
+            $after,
+            "
+             ORDER BY block_time DESC, slot DESC, transaction_index DESC, swap_ordinal DESC
+             LIMIT $2"
+        )
+    };
+}
+
+const SWAP_FIRST_PAGE_SQL: &str = swap_page_sql!("");
+const SWAP_PAGE_BEFORE_SQL: &str = swap_page_sql!(
+    "AND block_time <= $5
+               AND (block_time, slot, transaction_index, swap_ordinal) < ($5, $6, $7, $8)"
+);
+
 // pool_stats joins only while live: a rebuild may not have reached the pool's row yet, and an
 // unknown first swap is honest where a missing one would not be.
 const POOL_METADATA_SQL: &str = r#"
 SELECT p.address, p.mint_x, p.mint_y,
        token_x.decimals AS decimals_x, token_y.decimals AS decimals_y,
-       stats.first_swap_at
+       stats.first_swap_at, stats.last_swap_at
 FROM pool p
 LEFT JOIN token token_x ON token_x.mint = p.mint_x
 LEFT JOIN token token_y ON token_y.mint = p.mint_y
@@ -214,27 +278,75 @@ pub async fn read_swap_log_page(
     Ok(page)
 }
 
-pub async fn read_recent_swaps(
+// One row past the limit is read to learn whether another page exists without a count.
+// `first_swap_at` and `last_swap_at` are the pool's from pool_stats, None while it rebuilds:
+// the epoch and infinity then bound nothing, and the read is only slower.
+pub async fn read_swaps(
     database: &PgPool,
     pool: PoolAddress,
-    limit: RowCountMax,
-) -> Result<Vec<SwapRow>, StoreError> {
-    let rows = sqlx::query(
-        "SELECT signature, swap_ordinal, slot, block_time, user_address,
-                direction::text AS direction, mint_in, mint_out, amount_in, amount_out, fee,
-                protocol_fee, host_fee, fee_rate_1e9, mm_fee, limit_order_fee, amount_left,
-                fee_side::text AS fee_side, fee_token::text AS fee_token,
-                quote_asset_symbol, volume_usd, source::text AS source, fill_job_id
-         FROM swap
-         WHERE pool = $1
-         ORDER BY block_time DESC, slot DESC, transaction_index DESC, swap_ordinal DESC
-         LIMIT $2",
-    )
-    .bind(pool.to_string())
-    .bind(i64::from(limit.get()))
-    .fetch_all(database)
-    .await?;
-    rows.iter().map(swap_row_from_row).collect()
+    first_swap_at: Option<UnixSeconds>,
+    last_swap_at: Option<UnixSeconds>,
+    limit: PageLimit,
+    before: Option<SwapCursor>,
+) -> Result<SwapPage, StoreError> {
+    let fetch_count = i64::from(limit.get()) + 1;
+    let since = timestamp_from_unix(
+        first_swap_at.unwrap_or(UnixSeconds::new(0)),
+        "first_swap_at",
+    )?;
+    let until = last_swap_at
+        .map(|last| timestamp_from_unix(last, "last_swap_at"))
+        .transpose()?;
+    debug_assert!(first_swap_at.is_none_or(|first| last_swap_at.is_some_and(|last| first <= last)));
+    let rows = match before {
+        None => {
+            sqlx::query(SWAP_FIRST_PAGE_SQL)
+                // Unprepared: a generic plan may pick the time index on quiet pools.
+                .persistent(false)
+                .bind(pool.to_string())
+                .bind(fetch_count)
+                .bind(since)
+                .bind(until)
+                .fetch_all(database)
+                .await?
+        }
+        Some(cursor) => {
+            sqlx::query(SWAP_PAGE_BEFORE_SQL)
+                // Unprepared: a generic plan may pick the time index on quiet pools.
+                .persistent(false)
+                .bind(pool.to_string())
+                .bind(fetch_count)
+                .bind(since)
+                .bind(until)
+                .bind(timestamp_from_unix(cursor.block_time, "before")?)
+                .bind(slot_to_database(cursor.position.slot, "slot")?)
+                .bind(transaction_index_to_database(
+                    cursor.position.transaction_index,
+                )?)
+                .bind(swap_ordinal_to_database(cursor.position.swap_ordinal)?)
+                .fetch_all(database)
+                .await?
+        }
+    };
+    let mut swaps = rows
+        .iter()
+        .map(swap_row_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let more = swaps.len() > limit.get() as usize;
+    swaps.truncate(limit.get() as usize);
+    let next_cursor = if more {
+        swaps.last().map(SwapCursor::of)
+    } else {
+        None
+    };
+    debug_assert!(swaps.len() <= limit.get() as usize);
+    debug_assert!(next_cursor.is_none() || swaps.len() == limit.get() as usize);
+    debug_assert!(before.is_none_or(|cursor| {
+        swaps.first().map(SwapCursor::of).is_none_or(|first| {
+            (first.block_time, first.position) < (cursor.block_time, cursor.position)
+        })
+    }));
+    Ok(SwapPage { swaps, next_cursor })
 }
 
 fn swap_row_from_row(row: &PgRow) -> Result<SwapRow, StoreError> {
@@ -253,6 +365,7 @@ fn swap_row_from_row(row: &PgRow) -> Result<SwapRow, StoreError> {
         signature: address_from_database(&signature, "signature")?,
         swap_ordinal: swap_ordinal_from_database(row.try_get("swap_ordinal")?)?,
         slot: slot_from_database(row.try_get("slot")?, "slot")?,
+        transaction_index: transaction_index_from_database(row.try_get("transaction_index")?)?,
         block_time: unix_from_timestamp(block_time),
         user: address_from_database(&user, "user_address")?,
         direction: direction_from_database(&direction)?,
@@ -306,6 +419,8 @@ pub async fn read_pool_metadata(
     let mint_x: String = row.try_get("mint_x")?;
     let mint_y: String = row.try_get("mint_y")?;
     let first_swap_at: Option<DateTime<Utc>> = row.try_get("first_swap_at")?;
+    let last_swap_at: Option<DateTime<Utc>> = row.try_get("last_swap_at")?;
+    debug_assert_eq!(first_swap_at.is_some(), last_swap_at.is_some());
     Ok(Some(PoolMetadata {
         address: address_from_database(&address, "address")?,
         mint_x: address_from_database(&mint_x, "mint_x")?,
@@ -313,31 +428,70 @@ pub async fn read_pool_metadata(
         decimals_x: decimals_from_database(row.try_get("decimals_x")?, "decimals_x")?,
         decimals_y: decimals_from_database(row.try_get("decimals_y")?, "decimals_y")?,
         first_swap_at: first_swap_at.map(unix_from_timestamp),
+        last_swap_at: last_swap_at.map(unix_from_timestamp),
     }))
 }
 
 pub async fn read_pools(
     database: &PgPool,
-    limit: RowCountMax,
-) -> Result<ProjectionRead<Vec<PoolSummary>>, StoreError> {
-    let rows = sqlx::query(concat!(
-        pool_summary_sql!(),
-        "ORDER BY volume_usd_24h DESC, swap_count_24h DESC, p.address LIMIT $1"
-    ))
-    .bind(i64::from(limit.get()))
-    .fetch_all(database)
-    .await?;
-    // No pool means no row to carry the state, and nothing a rebuild could truncate either.
-    if let Some(row) = rows.first()
-        && let Some(projection) = pool_summary_rebuilding(row)?
-    {
+    limit: PageLimit,
+    offset: PageOffset,
+) -> Result<ProjectionRead<PoolPage>, StoreError> {
+    let rows = sqlx::query(POOL_PAGE_SQL)
+        .bind(i64::from(limit.get()))
+        .bind(i64::from(offset.get()))
+        .fetch_all(database)
+        .await?;
+    // The one-row base guarantees a first row: it carries the states and the count.
+    let Some(first) = rows.first() else {
+        return Err(StoreError::ValueOutOfRange {
+            column: "pool_count",
+        });
+    };
+    if let Some(projection) = pool_summary_rebuilding(first)? {
         return Ok(ProjectionRead::Rebuilding(projection));
     }
-    let pools = rows
-        .iter()
-        .map(pool_summary_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ProjectionRead::Live(pools))
+    let pool_count: u64 = count_from_database(first.try_get("pool_count")?, "pool_count")?;
+    let pools = pool_summaries_from_rows(&rows)?;
+    debug_assert!(pools.len() <= limit.get() as usize);
+    debug_assert!(pools.len() as u64 <= pool_count);
+    Ok(ProjectionRead::Live(PoolPage { pools, pool_count }))
+}
+
+// None when the pool is unknown. The caller checks existence first with read_pool_metadata,
+// which no rebuild holds back, so an unknown pool is a 404 even mid-rebuild.
+pub async fn read_pool_summary(
+    database: &PgPool,
+    pool: PoolAddress,
+) -> Result<ProjectionRead<Option<PoolSummary>>, StoreError> {
+    let rows = sqlx::query(POOL_SUMMARY_SQL)
+        .bind(pool.to_string())
+        .fetch_all(database)
+        .await?;
+    debug_assert!(rows.len() <= 1);
+    let Some(first) = rows.first() else {
+        return Err(StoreError::ValueOutOfRange {
+            column: "volume_1h_state",
+        });
+    };
+    if let Some(projection) = pool_summary_rebuilding(first)? {
+        return Ok(ProjectionRead::Rebuilding(projection));
+    }
+    let summary = pool_summaries_from_rows(&rows)?.pop();
+    debug_assert!(summary.is_none_or(|summary| summary.address == pool));
+    Ok(ProjectionRead::Live(summary))
+}
+
+// A row whose address is null is the empty LEFT JOIN of the one-row base, not a pool.
+fn pool_summaries_from_rows(rows: &[PgRow]) -> Result<Vec<PoolSummary>, StoreError> {
+    let mut pools = Vec::with_capacity(rows.len());
+    for row in rows {
+        let address: Option<String> = row.try_get("address")?;
+        if address.is_some() {
+            pools.push(pool_summary_from_row(row)?);
+        }
+    }
+    Ok(pools)
 }
 
 fn pool_summary_rebuilding(row: &PgRow) -> Result<Option<ProjectionName>, StoreError> {

@@ -65,8 +65,8 @@ pub enum QuoteAsset {
 impl QuoteAsset {
     pub const ALL: [Self; 3] = [Self::Sol, Self::Usdc, Self::Usdt];
 
-    // The ticker stored as asset_symbol and logged. SQL keeps it as text, not an enum, so this
-    // enum is the one allowlist and a new quote asset never needs a migration.
+    // SQL keeps the ticker as text, not an enum, so this is the one allowlist and a new quote
+    // asset never needs a migration.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Sol => "SOL",

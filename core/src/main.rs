@@ -37,14 +37,13 @@ const RPC_RPS_MAX_DEFAULT: u32 = 10;
 // of fast answers such as skipped slots.
 const ARCHIVE_RPS_MAX_DEFAULT: u32 = 20;
 const BINANCE_DATA_API_URL_DEFAULT: &str = "https://data-api.binance.vision";
-// Configurable sources were misconfigurable; onboarding a market is a code change.
+// A constant, not configuration: onboarding a market is a code change.
 const PRICE_SOURCE_MARKET: PriceSource = PriceSource::Binance;
-// Compose gives 30 s between SIGTERM and SIGKILL; the live sources, the filler and the drain
-// share it. The supervisor stops two sources of up to 2 s each one after the other, so 6 s
-// leaves it room before it is aborted (which aborts its sources too).
+// The three stops run one after another and must all finish inside compose's 30 s between
+// SIGTERM and SIGKILL, so they sum to 26 s and leave margin for the exit itself.
 const SUPERVISOR_STOP_TIMEOUT: Duration = Duration::from_secs(6);
-const FILLER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-const PROCESSOR_STOP_TIMEOUT: Duration = Duration::from_secs(16);
+const FILLER_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+const PROCESSOR_STOP_TIMEOUT: Duration = Duration::from_secs(12);
 // The rebuild runs one page transaction at a time; a spare connection covers the state update.
 const REBUILD_CONNECTION_COUNT_MAX: u32 = 2;
 const INSTANCE_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -617,7 +616,9 @@ async fn stop_supervisor(actors: &mut Actors) -> Result<(), RunError> {
 }
 
 async fn stop_filler(actors: &mut Actors) -> Result<(), RunError> {
-    let _ = actors.filler_sender.try_send(FillerMessage::Shutdown);
+    if let Err(error) = actors.filler_sender.try_send(FillerMessage::Shutdown) {
+        tracing::debug!(%error, "range_filler_shutdown_not_sent");
+    }
     match tokio::time::timeout(FILLER_STOP_TIMEOUT, &mut actors.filler).await {
         Ok(joined) => flatten("range filler", joined),
         Err(_) => {

@@ -48,8 +48,8 @@ impl Caches {
     }
 }
 
-// The §4.2 transaction for one block. Caches change only after the commit, so a failed
-// attempt leaves them as they were and a retry enriches the same way.
+// One database transaction per block. Caches change only after the commit, so a failed attempt
+// leaves them as they were and a retry enriches the same way.
 pub async fn process_block(
     connection: &mut PgConnection,
     block: &FinalizedBlock,
@@ -86,7 +86,6 @@ pub async fn process_block(
     Ok(stored)
 }
 
-// How a block's swaps are priced: which quote mints count, and the market source.
 pub struct PricingSettings {
     pub allowlist: QuoteAllowlist,
     pub market: PriceSource,

@@ -181,7 +181,7 @@ impl RpcGateway {
         Ok(Slot::new(slot))
     }
 
-    // The oldest slot the node serves; on the archive, the first slot of its oldest epoch.
+    // On the archive, the first slot of its oldest epoch.
     pub async fn first_available_block(&self, lane: RequestLane) -> Result<Slot, RpcError> {
         let slot: u64 = self.call(request_first_available_block(), lane).await?;
         Ok(Slot::new(slot))
@@ -533,7 +533,8 @@ fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
 fn is_retryable(error: &RpcError) -> bool {
     match error {
         RpcError::Transport(_) | RpcError::EmptyBody => true,
-        RpcError::Status { status, .. } => *status == 429 || *status >= 500,
+        // 408 is the server giving up on a slow request, as transient as a 5xx.
+        RpcError::Status { status, .. } => matches!(*status, 408 | 429) || *status >= 500,
         RpcError::JsonRpc { code, .. } => matches!(
             *code,
             CODE_BLOCK_NOT_AVAILABLE
@@ -1107,10 +1108,12 @@ mod tests {
     // Only transient failures are retried in place; terminal ones surface at once.
     #[test]
     fn retry_predicate_covers_transient_failures_only() {
-        assert!(is_retryable(&RpcError::Status {
-            status: 503,
-            retry_after_ms: None
-        }));
+        for status in [408, 429, 503] {
+            assert!(is_retryable(&RpcError::Status {
+                status,
+                retry_after_ms: None
+            }));
+        }
         assert!(!is_retryable(&RpcError::Status {
             status: 401,
             retry_after_ms: None
