@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import {
-  BACKFILL_INSTANT, BACKFILL_JOB, BROKEN_POOL, GARBLED_POOL, METEORA_VOLUMES, MISSING_POOL, POOL, SLOW_POOL, VOLUME_BODY,
+  BACKFILL_INSTANT, BACKFILL_JOB, BACKFILL_JOBS, BROKEN_POOL, CANCELLED_JOB, GARBLED_POOL, METEORA_VOLUMES, MISSING_POOL, POOL, SLOW_POOL, VOLUME_BODY,
   runCli, startMockApi, type MockApi,
 } from "./mock_api.ts";
 
@@ -37,13 +37,25 @@ test("health --output json prints one envelope in contract key order", async () 
   expect(result.stderr).toBe("");
 });
 
-test("pools --output json passes the limit and lists pools", async () => {
+test("pools --output json passes the limit and lists pools with the API's page", async () => {
   const result = await json("pools", "--limit", "7");
   const envelope = parseOnlyObject(result.stdout);
   expect(result.exit_code).toBe(0);
-  expect(envelope.request.params).toEqual({ limit: "7" });
+  expect(envelope.request.params).toEqual({ limit: "7", offset: "0" });
   expect(envelope.data.map((pool: { address: string }) => pool.address)).toEqual([POOL]);
   expect(envelope.summary).toEqual({ pool_count: 1, total_volume_usd_24h: "0.3" });
+  expect(Object.keys(envelope)).toEqual(["meta", "request", "response", "data", "summary", "page", "error"]);
+  expect(envelope.page).toEqual({ limit: 7, offset: 0, total: 1 });
+});
+
+// A limit is capped at 100, so --offset is how a caller reads the ranking past it.
+test("pools --offset pages past the limit", async () => {
+  const result = await json("pools", "--limit", "100", "--offset", "100");
+  const envelope = parseOnlyObject(result.stdout);
+  expect(result.exit_code).toBe(0);
+  expect(envelope.request.params).toEqual({ limit: "100", offset: "100" });
+  expect(envelope.data).toEqual([]);
+  expect(envelope.page).toEqual({ limit: 100, offset: 100, total: 1 });
 });
 
 test("volume --range 24h sends the aligned window and sums USD exactly", async () => {
@@ -157,6 +169,9 @@ test.each([
   { name: "a pool that is not base58", argv: ["swaps", "--pool", "not-a-pool"] },
   { name: "an unknown --bucket", argv: ["volume", "--pool", POOL, "--bucket", "week", "--range", "24h"] },
   { name: "a non-numeric --limit", argv: ["pools", "--limit", "many"] },
+  { name: "a pools --limit above the API's 100", argv: ["pools", "--limit", "101"] },
+  { name: "a swaps --limit above the API's 100", argv: ["swaps", "--pool", POOL, "--limit", "101"] },
+  { name: "a negative --offset", argv: ["pools", "--offset", "-1"] },
   { name: "an unknown command", argv: ["bogus"] },
 ])("usage error exits 2 with nothing on stdout: $name", async ({ argv }) => {
   const result = await json(...argv);
@@ -203,3 +218,76 @@ test("backfill exits 1 with the API's envelope when it refuses, and 2 without --
   expect(missing.stderr).toContain("missing --from");
 });
 
+
+test("backfill --cancel sends DELETE for the job and returns what the API cancelled", async () => {
+  const result = await json("backfill", "--cancel", "7");
+  const envelope = parseOnlyObject(result.stdout);
+  expect(result.exit_code).toBe(0);
+  expect(envelope.request.method).toBe("DELETE");
+  expect(envelope.request.url).toBe(`${api.base_url}/v1/backfills/7`);
+  expect(envelope.request.body).toBeUndefined();
+  expect(envelope.data).toEqual(CANCELLED_JOB);
+  expect(envelope.summary).toEqual({ job_id: 7, state: "cancelled", slot_count_unfilled: 300 });
+});
+
+test("backfill --cancel exits 1 on a refusal, and 2 on a bad id or on two modes at once", async () => {
+  const refused = await json("backfill", "--cancel", "8");
+  expect(refused.exit_code).toBe(1);
+  expect(parseOnlyObject(refused.stdout).error.body.error.code).toBe("job_already_blocked");
+
+  const table = await runCli(["--base-url", api.base_url, "backfill", "--cancel", "7"]);
+  expect(table.exit_code).toBe(0);
+  expect(table.stderr).toContain(`curl -sS -X DELETE`);
+
+  const malformed = await json("backfill", "--cancel", "seven");
+  expect(malformed.exit_code).toBe(2);
+  const both = await json("backfill", "--cancel", "7", "--list");
+  expect(both.exit_code).toBe(2);
+  expect(both.stderr).toContain("only one of");
+});
+
+test("backfill --list returns the API's jobs, and the table shows each id, state and reason", async () => {
+  const result = await json("backfill", "--list");
+  const envelope = parseOnlyObject(result.stdout);
+  expect(result.exit_code).toBe(0);
+  expect(envelope.request.method).toBe("GET");
+  expect(envelope.request.url).toBe(`${api.base_url}/v1/backfills`);
+  expect(envelope.data).toEqual(BACKFILL_JOBS);
+  expect(envelope.summary).toEqual({ job_count: 2, state_counts: { cancelled: 1, open: 1 } });
+
+  const table = await runCli(["--base-url", api.base_url, "backfill", "--list"]);
+  expect(table.exit_code).toBe(0);
+  const lines = table.stdout.split("\n");
+  expect(lines.findIndex((line) => line.includes("cancelled") && line.includes("620"))).toBeLessThan(
+    lines.findIndex((line) => line.includes("open") && line.includes("1200")),
+  );
+});
+
+const TERMINAL = { stdin_is_tty: true, stdout_is_tty: true };
+
+// Each refusal is checked on a terminal (except the TTY case itself), so it is that guard and not
+// the TTY check that refuses.
+test.each([
+  { name: "without a terminal", argv: ["--interactive"], terminal: {}, reason: "needs a terminal on stdin and stdout" },
+  { name: "with only stdout piped", argv: ["-i"], terminal: { stdin_is_tty: true }, reason: "needs a terminal on stdin and stdout" },
+  { name: "with --no-input", argv: ["--no-input", "-i"], terminal: TERMINAL, reason: "cannot be combined with --no-input" },
+  { name: "with --output json", argv: ["-i", "--output", "json"], terminal: TERMINAL, reason: "cannot be combined with --output json" },
+  { name: "after a subcommand, without a terminal", argv: ["pools", "--interactive"], terminal: {}, reason: "needs a terminal on stdin and stdout" },
+])("--interactive refuses $name: exit 2, one line on stderr, no request", async ({ argv, terminal, reason }) => {
+  const before = api.requested_urls.length;
+  const result = await runCli(["--base-url", api.base_url, ...argv], {}, terminal);
+  expect(result.exit_code).toBe(2);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toBe(`metclanker: --interactive ${reason}; use the subcommands instead\n`);
+  expect(api.requested_urls.length).toBe(before);
+});
+
+test("bare metclanker prints help on stderr and exits 2, and an unknown command still says so", async () => {
+  const bare = await runCli([]);
+  expect(bare.exit_code).toBe(2);
+  expect(bare.stderr).toContain("Usage: metclanker");
+  expect(bare.stderr).toContain("--interactive");
+  const unknown = await runCli(["bogus"]);
+  expect(unknown.exit_code).toBe(2);
+  expect(unknown.stderr).toContain("unknown command 'bogus'");
+});

@@ -2,6 +2,7 @@ import { readVolume, type VolumeBody } from "../api_types.ts";
 import { paintBars } from "../color.ts";
 import {
   compareBuckets,
+  type ComparedBucket,
   firstIndexedStart,
   meteoraParams,
   meteoraPath,
@@ -18,11 +19,15 @@ import { resolvePool } from "./pool_input.ts";
 import { resolveBucket, resolveWindow, type VolumeFlags } from "./volume_input.ts";
 import { compareRows, compareSummary, COMPARE_COLUMNS, volumeRows, volumeSummary, VOLUME_COLUMNS } from "./volume_view.ts";
 
+function plainSummary(volume: VolumeBody) {
+  return { ...volumeSummary(volume.buckets), bucket: volume.bucket, from: volume.from, to: volume.to };
+}
+
 function plainResult(context: Context, exchange: Exchange, volume: VolumeBody): CommandResult {
   return {
     exchanges: [exchange],
     data: volume.buckets,
-    summary: { ...volumeSummary(volume.buckets), bucket: volume.bucket, from: volume.from, to: volume.to },
+    summary: plainSummary(volume),
     table: () => paintBars(renderTable(volumeRows(volume.buckets), VOLUME_COLUMNS), context.paint),
     note: { title: "curl", message: curlCommand(exchange.request) },
     exit_code: EXIT_CODE_OK,
@@ -52,6 +57,13 @@ async function fetchMeteora(context: Context, pool: string, range: UnixRange, bu
 
 type CompareTarget = { base_url: string; pool: string; range: UnixRange; bucket: BucketName };
 
+// A failed comparison keeps our buckets: Meteora being down says nothing about our numbers.
+export type Comparison =
+  | { kind: "compared"; compared: ComparedBucket[]; exchange: Exchange }
+  | { kind: "failed"; failure: CliFailure; target: CompareTarget };
+
+export type VolumeLoad = { exchange: Exchange; volume: VolumeBody; comparison: Comparison | null };
+
 function compareFailureResult(base: CommandResult, failure: CliFailure, target: CompareTarget): CommandResult {
   const request = failure.request ?? buildRequest(target.base_url, meteoraPath(target.pool), meteoraParams(target.range, target.bucket));
   const error = envelopeError(failure);
@@ -64,40 +76,55 @@ function compareFailureResult(base: CommandResult, failure: CliFailure, target: 
   };
 }
 
-async function withComparison(context: Context, base: CommandResult, volume: VolumeBody, range: UnixRange, bucket: BucketName): Promise<CommandResult> {
+function comparedResult(context: Context, base: CommandResult, volume: VolumeBody, comparison: Extract<Comparison, { kind: "compared" }>): CommandResult {
+  const { compared, exchange } = comparison;
+  return {
+    ...base,
+    exchanges: [...base.exchanges, exchange],
+    data: compared,
+    summary: { ...plainSummary(volume), compare: compareSummary(compared) },
+    compare: { request: exchange.request, response: exchange.response, error: null },
+    table: () => paintBars(renderTable(compareRows(compared), COMPARE_COLUMNS), context.paint),
+  };
+}
+
+async function compareVolume(context: Context, volume: VolumeBody, range: UnixRange, bucket: BucketName): Promise<Comparison> {
   const effective = effectiveRange(volume, range);
   try {
     const meteora = await fetchMeteora(context, volume.pool, effective, bucket);
     const first_indexed = firstIndexedStart(volume.first_swap_at, volume.buckets, bucket);
     const now_unix_seconds = Math.floor(context.io.now().getTime() / 1_000);
     const compared = compareBuckets(volume.buckets, meteora.points, { first_indexed, bucket, now_unix_seconds });
-    return {
-      ...base,
-      exchanges: [...base.exchanges, meteora.exchange],
-      data: compared,
-      summary: { ...(base.summary as object), compare: compareSummary(compared) },
-      compare: { request: meteora.exchange.request, response: meteora.exchange.response, error: null },
-      table: () => paintBars(renderTable(compareRows(compared), COMPARE_COLUMNS), context.paint),
-    };
+    return { kind: "compared", compared, exchange: meteora.exchange };
   } catch (error) {
     if (!(error instanceof CliFailure)) {
       throw error;
     }
-    context.io.write_stderr(`metclanker: --compare failed: ${error.message}\n`);
-    return compareFailureResult(base, error, { base_url: meteoraBaseUrl(context), pool: volume.pool, range: effective, bucket });
+    return { kind: "failed", failure: error, target: { base_url: meteoraBaseUrl(context), pool: volume.pool, range: effective, bucket } };
   }
 }
 
-export async function runVolume(context: Context, flags: VolumeFlags): Promise<CommandResult> {
+// The loads alone, typed, for the interactive shell; runVolume wraps them into a CommandResult.
+export async function loadVolume(context: Context, flags: VolumeFlags): Promise<VolumeLoad> {
   const pool = await resolvePool(context, flags.pool, "volume");
   const bucket = await resolveBucket(context, flags.bucket);
   const window = await resolveWindow(context, flags, bucket);
   const params = { bucket, from: window.from, to: window.to };
   const { exchange, body } = await fetchApi(context, `/v1/pools/${pool}/volume`, params);
   const volume = readVolume(body, exchange);
+  const comparison = flags.compare === true ? await compareVolume(context, volume, window.range, bucket) : null;
+  return { exchange, volume, comparison };
+}
+
+export async function runVolume(context: Context, flags: VolumeFlags): Promise<CommandResult> {
+  const { exchange, volume, comparison } = await loadVolume(context, flags);
   const base = plainResult(context, exchange, volume);
-  if (flags.compare !== true) {
+  if (comparison === null) {
     return base;
   }
-  return withComparison(context, base, volume, window.range, bucket);
+  if (comparison.kind === "compared") {
+    return comparedResult(context, base, volume, comparison);
+  }
+  context.io.write_stderr(`metclanker: --compare failed: ${comparison.failure.message}\n`);
+  return compareFailureResult(base, comparison.failure, comparison.target);
 }

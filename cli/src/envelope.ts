@@ -1,3 +1,4 @@
+import type { OffsetPage } from "./api_types.ts";
 import type { CliFailure } from "./failure.ts";
 import { errorBody, type Exchange, type RequestRecord, type ResponseRecord } from "./http.ts";
 import { TOOL_NAME, TOOL_VERSION } from "./version.ts";
@@ -21,6 +22,7 @@ export type Envelope = {
   response: ResponseRecord | null;
   data: unknown;
   summary: unknown;
+  page?: OffsetPage;
   compare?: CompareSection;
   error: EnvelopeError | null;
 };
@@ -31,6 +33,7 @@ export type EnvelopeParts = {
   request?: RequestRecord | null;
   data: unknown;
   summary: unknown;
+  page?: OffsetPage;
   compare?: CompareSection;
   error?: EnvelopeError | null;
 };
@@ -43,6 +46,7 @@ export function buildEnvelope(parts: EnvelopeParts): Envelope {
     response: parts.exchange?.response ?? null,
     data: parts.data,
     summary: parts.summary,
+    ...(parts.page === undefined ? {} : { page: parts.page }),
     ...(parts.compare === undefined ? {} : { compare: parts.compare }),
     error: parts.error ?? null,
   };

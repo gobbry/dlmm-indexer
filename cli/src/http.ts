@@ -2,7 +2,7 @@ import { CliFailure } from "./failure.ts";
 import { TOOL_NAME, TOOL_VERSION } from "./version.ts";
 
 export type RequestRecord = {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "DELETE";
   url: string;
   params: Record<string, string>;
   headers: Record<string, string>;
@@ -33,6 +33,10 @@ export function buildRequest(base_url: string, path: string, params: Record<stri
     params,
     headers: { accept: "application/json", "user-agent": `${TOOL_NAME}/${TOOL_VERSION}` },
   };
+}
+
+export function buildDeleteRequest(base_url: string, path: string): RequestRecord {
+  return { ...buildRequest(base_url, path, {}), method: "DELETE" };
 }
 
 export function buildPostRequest(base_url: string, path: string, body: unknown): RequestRecord {

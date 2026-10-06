@@ -3,7 +3,7 @@ import { fetchApi, missingFlag, type Context } from "../context.ts";
 import { usageFailure } from "../failure.ts";
 import { promptPool } from "../prompts.ts";
 
-const BASE58_ADDRESS_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+export const BASE58_ADDRESS_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const PICKER_POOL_COUNT = 50;
 
 export async function resolvePool(context: Context, pool: string | undefined, command: string): Promise<string> {

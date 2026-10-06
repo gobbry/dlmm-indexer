@@ -4,9 +4,9 @@ import { EXIT_CODE_OK } from "../failure.ts";
 import { alignRight, curlCommand, displayValue, renderTable, shortenMiddle } from "../format.ts";
 import { resolvePool } from "./pool_input.ts";
 
-const COLUMNS = ["block_time", "signature", "ordinal", "source", "direction", "amount_in", "amount_out", "fee", "volume_usd"] as const;
+export const SWAP_COLUMNS = ["block_time", "signature", "ordinal", "source", "direction", "amount_in", "amount_out", "fee", "volume_usd"] as const;
 
-function swapRows(swaps: readonly SwapRow[]) {
+export function swapRows(swaps: readonly SwapRow[]) {
   const rows = swaps.map((swap) => ({
     block_time: displayValue(swap.block_time),
     signature: shortenMiddle(swap.signature, 8),
@@ -31,7 +31,7 @@ export async function runSwaps(context: Context, flags: SwapsFlags): Promise<Com
     exchanges: [exchange],
     data: swaps,
     summary: { pool, swap_count: swaps.length },
-    table: () => renderTable(swapRows(swaps), COLUMNS),
+    table: () => renderTable(swapRows(swaps), SWAP_COLUMNS),
     note: { title: "curl", message: curlCommand(exchange.request) },
     exit_code: EXIT_CODE_OK,
   };

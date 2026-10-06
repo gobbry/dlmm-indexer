@@ -1,8 +1,9 @@
+import type { OffsetPage } from "./api_types.ts";
 import { colorEnabled, createPaint, type Paint } from "./color.ts";
 import { buildEnvelope, serializeEnvelope, type CompareSection, type EnvelopeError } from "./envelope.ts";
 import { usageFailure } from "./failure.ts";
 import { rawText } from "./format.ts";
-import { buildPostRequest, buildRequest, decodeBody, send, type Exchange, type RequestRecord } from "./http.ts";
+import { buildDeleteRequest, buildPostRequest, buildRequest, decodeBody, send, type Exchange, type RequestRecord } from "./http.ts";
 import type { Io } from "./io.ts";
 import { createProgress, showNote } from "./ui.ts";
 
@@ -30,6 +31,7 @@ export type CommandResult = {
   exchanges: Exchange[];
   data: unknown;
   summary: unknown;
+  page?: OffsetPage;
   compare?: CompareSection;
   error?: EnvelopeError | null;
   table: () => string;
@@ -81,6 +83,10 @@ export function postApi(context: Context, path: string, body: unknown, timeout_m
   return sendRequest(context, buildPostRequest(context.options.base_url, path, body), timeout_ms);
 }
 
+export function deleteApi(context: Context, path: string) {
+  return sendRequest(context, buildDeleteRequest(context.options.base_url, path), context.options.timeout_ms);
+}
+
 export function missingFlag(flag: string, command: string): Error {
   return usageFailure(`missing ${flag} (required by '${command}' without a terminal; see metclanker ${command} --help)`);
 }
@@ -93,6 +99,7 @@ export function present(context: Context, result: CommandResult): number {
       exchange: result.exchanges[0] ?? null,
       data: result.data,
       summary: result.summary,
+      ...(result.page === undefined ? {} : { page: result.page }),
       ...(result.compare === undefined ? {} : { compare: result.compare }),
       error: result.error ?? null,
     });

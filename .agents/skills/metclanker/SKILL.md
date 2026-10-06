@@ -9,6 +9,8 @@ compatibility: "Requires Bun 1.3+ (run from cli/ with `bun run src/cli.ts`, or t
 Agents always pass `--output json --no-input`. JSON mode prints exactly one JSON object on
 stdout and nothing else; diagnostics go to stderr. `--no-input` guarantees no prompt: a
 missing flag exits 2 instead of waiting for a terminal.
+`--interactive` (`-i`) opens a terminal browser for people; agents must not use it (it exits 2
+without a terminal, with `--no-input` or with `--output json`).
 
 ```sh
 cd cli && bun run src/cli.ts <command> [flags] --output json --no-input
@@ -19,10 +21,12 @@ cd cli && bun run src/cli.ts <command> [flags] --output json --no-input
 | command | flags | API call |
 |---|---|---|
 | `health` | | `GET /v1/health` |
-| `pools` | `--limit N` (default 50) | `GET /v1/pools?limit=N` |
+| `pools` | `--limit N` (1 to 100, default 50) `--offset N` (default 0) | `GET /v1/pools?limit=N&offset=N` |
 | `volume` | `--pool <base58>` `--bucket hour\|day` and either `--range 24h\|7d\|30d` or `--from <rfc3339> --to <rfc3339>`; `--compare` | `GET /v1/pools/{pool}/volume?bucket=&from=&to=` |
-| `swaps` | `--pool <base58>` `--limit N` (default 20) | `GET /v1/pools/{pool}/swaps?limit=N` |
+| `swaps` | `--pool <base58>` `--limit N` (1 to 100, default 20) | `GET /v1/pools/{pool}/swaps?limit=N` |
 | `backfill` | `--from <rfc3339>` (not in the future) | `POST /v1/backfills` with `{"from": …}` |
+| `backfill` | `--list` | `GET /v1/backfills` (the 50 newest jobs) |
+| `backfill` | `--cancel <job_id>` | `DELETE /v1/backfills/{job_id}` |
 
 Global flags, accepted before or after the command:
 
@@ -50,21 +54,29 @@ Keys always appear in this order:
   "response": { "status": 200, "latency_ms": 143, "headers": { … }, "body_bytes": 8396 },
   "data": …,
   "summary": …,
+  "page": { "limit": 50, "offset": 0, "total": 312 },
   "compare": { "request": …, "response": …, "error": null },
   "error": null
 }
 ```
 
+- `page` is present only for `pools`: `total` is every indexed pool, so read past the first
+  100 with `--offset` (`--limit` above 100 exits 2). The ranking moves as blocks land, so a
+  pool can cross a page boundary between calls.
 - `compare` is present only with `--compare`. A `backfill` envelope's `request` also carries
   `body`, the JSON sent.
 - `data`: `health` → the health object; `pools` → pool list; `volume` → the API's buckets
   (`start`, `swap_count`, `volume_x`, `volume_x_raw`, `volume_y`, `volume_y_raw`,
   `volume_usd`, `unpriced_swap_count`); `swaps` → swap list; `backfill` → the job the API
-  inserted (`job_id`, `start_slot`, `end_slot`).
+  inserted (`job_id`, `start_slot`, `end_slot`); `backfill --list` → job list (`job_id`,
+  `state`, `start_slot`, `end_slot`, `next_slot`, `end_kind`, `blocked_reason`,
+  `completed_at`, `created_at`), newest first; `backfill --cancel` → the cancelled job
+  (`job_id`, `start_slot`, `end_slot`, `next_slot`, `state: "cancelled"`).
 - `summary`: `volume` → `total_usd` (exact decimal string), `max_bucket`, `bucket_count`,
   `swap_count`, `unpriced_swap_count`, `bucket`, `from`, `to`; `pools` → `pool_count`,
   `total_volume_usd_24h`; `swaps` → `pool`, `swap_count`; `health` → `status`, `lag_seconds`;
-  `backfill` → `job_id`, `slot_count`.
+  `backfill` → `job_id`, `slot_count`; `backfill --list` → `job_count`, `state_counts`;
+  `backfill --cancel` → `job_id`, `state`, `slot_count_unfilled`.
 - Health `status`, first match wins: `starting` (no cursor yet), `lagging` (`lag_seconds >
   120`), `blocked` (`blocked_job_count > 0`: a slot range the node cannot serve; needs an
   operator), `backfilling` (`open_job_count > 0`: holes in coverage still being
@@ -133,6 +145,22 @@ least 120 s whatever `--timeout-ms` says. It answers 202 with the job, or a refu
 instant is not older than what is indexed); 409 `nothing_indexed_yet` or
 `backfill_overlaps_job` (an earlier backfill owns part of the range); 502 `rpc_unavailable`;
 503 `backfill_unavailable` (the API runs without `RPC_URL`). Do not resubmit on 409.
+
+A request older than a week is split at the week line by the indexer seconds later; the job
+id you were given stays on the newest piece, and `--list` shows the others under their own
+ids. Find a job's id with `--list`, and stop a backfill with `--cancel` (only when the user
+asks):
+
+```sh
+bun run src/cli.ts backfill --list --output json --no-input
+bun run src/cli.ts backfill --cancel 7 --output json --no-input
+```
+
+A cancel keeps the job as blocked with reason `cancelled`, so the indexer does not reopen its
+range; from then on `health` reports `blocked`, which is expected: the history below where the
+walk stopped is deliberately missing. Refusals: 404 `job_not_found`; 409
+`job_already_completed` or `job_already_blocked` (the message names the existing reason).
+Resuming is an operator's database step (README, Backfill), not a CLI command.
 
 ## Failure handling
 

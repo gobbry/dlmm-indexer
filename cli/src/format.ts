@@ -31,7 +31,8 @@ export function curlCommand(request: RequestRecord): string {
   if (request.body !== undefined) {
     return `curl -sS -X POST ${accept} -H ${shellQuote("content-type: application/json")} -d ${shellQuote(request.body)} ${shellQuote(request.url)}`;
   }
-  return `curl -sS ${accept} ${shellQuote(request.url)}`;
+  const method = request.method === "GET" ? "" : `-X ${request.method} `;
+  return `curl -sS ${method}${accept} ${shellQuote(request.url)}`;
 }
 
 export function rawText(exchange: Exchange): string {
@@ -58,11 +59,13 @@ export function alignRight(rows: Row[], columns: readonly string[]): Row[] {
   });
 }
 
-export function renderTable(rows: Row[], columns: readonly string[]): string {
+// Bun labels each row with its key; a non-zero index_base numbers the rows from it (a rank, say).
+export function renderTable(rows: Row[], columns: readonly string[], index_base = 0): string {
   if (rows.length === 0) {
     return "(no rows)\n";
   }
-  return `${Bun.inspect.table(rows, [...columns])}`;
+  const keyed = index_base === 0 ? rows : Object.fromEntries(rows.map((row, index) => [index + index_base, row]));
+  return `${Bun.inspect.table(keyed, [...columns])}`;
 }
 
 export function shortenMiddle(text: string, keep_each_side: number): string {
@@ -77,4 +80,9 @@ export function displayValue(value: unknown): string {
     return "";
   }
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+export function fieldTable(record: object): string {
+  const rows = Object.entries(record).map(([field, value]) => ({ field, value: displayValue(value) }));
+  return renderTable(rows, ["field", "value"]);
 }
