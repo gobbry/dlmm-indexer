@@ -44,6 +44,10 @@ pub enum ApiError {
     },
     #[error("limit must be an integer from 1 to {limit_max}")]
     InvalidLimit { limit_max: u32 },
+    #[error("offset must be a non-negative integer")]
+    InvalidOffset,
+    #[error("before must be a next_cursor this API returned")]
+    InvalidCursor,
     #[error("no such route")]
     NotFound,
     #[error("database is unavailable")]
@@ -60,6 +64,16 @@ pub enum ApiError {
     NothingIndexedYet,
     #[error("another job already owns part of that range")]
     BackfillOverlapsJob,
+    #[error("job_id must be a positive integer")]
+    InvalidJobId,
+    #[error("no job has that id")]
+    JobNotFound,
+    #[error("the job is already completed: there is nothing left to cancel")]
+    JobAlreadyCompleted,
+    #[error(
+        "the job is already blocked ({reason}); it is not walked, so there is nothing to cancel"
+    )]
+    JobAlreadyBlocked { reason: String },
     #[error("backfill needs RPC_URL, which the API was started without")]
     BackfillUnavailable,
     #[error("the RPC endpoint failed while resolving from to a slot")]
@@ -79,6 +93,8 @@ impl ApiError {
             Self::InvalidRange => "invalid_range",
             Self::RangeTooLarge { .. } => "range_too_large",
             Self::InvalidLimit { .. } => "invalid_limit",
+            Self::InvalidOffset => "invalid_offset",
+            Self::InvalidCursor => "invalid_cursor",
             Self::NotFound => "not_found",
             Self::DatabaseUnavailable => "database_unavailable",
             Self::ProjectionRebuilding { .. } => "projection_rebuilding",
@@ -87,6 +103,10 @@ impl ApiError {
             Self::BackfillFromAfterCoverage => "backfill_from_after_coverage",
             Self::NothingIndexedYet => "nothing_indexed_yet",
             Self::BackfillOverlapsJob => "backfill_overlaps_job",
+            Self::InvalidJobId => "invalid_job_id",
+            Self::JobNotFound => "job_not_found",
+            Self::JobAlreadyCompleted => "job_already_completed",
+            Self::JobAlreadyBlocked { .. } => "job_already_blocked",
             Self::BackfillUnavailable => "backfill_unavailable",
             Self::RpcUnavailable => "rpc_unavailable",
             Self::Internal => "internal",
@@ -95,11 +115,14 @@ impl ApiError {
 
     pub const fn status(&self) -> StatusCode {
         match self {
-            Self::PoolNotFound | Self::NotFound => StatusCode::NOT_FOUND,
+            Self::PoolNotFound | Self::NotFound | Self::JobNotFound => StatusCode::NOT_FOUND,
             Self::DatabaseUnavailable
             | Self::ProjectionRebuilding { .. }
             | Self::BackfillUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::NothingIndexedYet | Self::BackfillOverlapsJob => StatusCode::CONFLICT,
+            Self::NothingIndexedYet
+            | Self::BackfillOverlapsJob
+            | Self::JobAlreadyCompleted
+            | Self::JobAlreadyBlocked { .. } => StatusCode::CONFLICT,
             Self::RpcUnavailable => StatusCode::BAD_GATEWAY,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidPool
@@ -109,7 +132,10 @@ impl ApiError {
             | Self::InvalidRange
             | Self::RangeTooLarge { .. }
             | Self::InvalidLimit { .. }
+            | Self::InvalidOffset
+            | Self::InvalidCursor
             | Self::InvalidBackfillBody
+            | Self::InvalidJobId
             | Self::BackfillFromInFuture
             | Self::BackfillFromAfterCoverage => StatusCode::BAD_REQUEST,
         }

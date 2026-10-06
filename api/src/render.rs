@@ -1,8 +1,10 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use dlmm_core::domain::amounts::{Decimals, QuoteAsset, TokenAmountRaw};
-use dlmm_core::domain::ids::UnixSeconds;
+use dlmm_core::domain::ids::{JobId, PoolAddress, Slot, SlotRange, UnixSeconds};
+use dlmm_core::domain::job::JobListing;
 use dlmm_core::domain::query::{
-    AlignedRange, Bucket, IndexerHealth, PoolMetadata, PoolSummary, SwapRow, VolumeBucket,
+    AlignedRange, Bucket, IndexerHealth, PageLimit, PageOffset, PoolMetadata, PoolPage,
+    PoolSummary, SwapPage, SwapRow, VolumeBucket,
 };
 use dlmm_core::domain::swap::{FeeSide, FeeToken};
 use rust_decimal::Decimal;
@@ -20,12 +22,47 @@ pub enum IndexerStatus {
     Starting,
 }
 
-// The job a backfill request inserted; its progress shows in /v1/health's open_job_count.
 #[derive(Debug, Serialize)]
 pub struct BackfillBody {
     pub job_id: i64,
     pub start_slot: u64,
     pub end_slot: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Open,
+    Blocked,
+    Cancelled,
+    Completed,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JobBody {
+    pub job_id: i64,
+    pub state: JobState,
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub next_slot: u64,
+    pub end_kind: &'static str,
+    pub blocked_reason: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JobListBody {
+    pub jobs: Vec<JobBody>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CancelBody {
+    pub job_id: i64,
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub next_slot: u64,
+    pub state: JobState,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,8 +118,23 @@ pub struct PoolBody {
 }
 
 #[derive(Debug, Serialize)]
+pub struct OffsetPageBody {
+    pub limit: u32,
+    pub offset: u32,
+    pub total: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PoolListBody {
     pub pools: Vec<PoolBody>,
+    pub page: OffsetPageBody,
+}
+
+// next_cursor goes back as `before` for the next older page; null on the last one.
+#[derive(Debug, Serialize)]
+pub struct CursorPageBody {
+    pub limit: u32,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +168,7 @@ pub struct SwapBody {
 pub struct SwapListBody {
     pub pool: String,
     pub swaps: Vec<SwapBody>,
+    pub page: CursorPageBody,
 }
 
 pub fn timestamp_text(seconds: UnixSeconds) -> String {
@@ -188,6 +241,48 @@ pub fn render_health(health: &IndexerHealth, now: UnixSeconds) -> HealthBody {
     }
 }
 
+pub fn job_state(job: &JobListing) -> JobState {
+    if job.completed_at.is_some() {
+        return JobState::Completed;
+    }
+    match &job.blocked_reason {
+        None => JobState::Open,
+        Some(reason) if reason.is_cancelled() => JobState::Cancelled,
+        Some(_) => JobState::Blocked,
+    }
+}
+
+pub fn render_job(job: &JobListing) -> JobBody {
+    debug_assert!(job.range.start <= job.range.end_inclusive);
+    debug_assert!(job.next_slot >= job.range.start);
+    JobBody {
+        job_id: job.id.get(),
+        state: job_state(job),
+        start_slot: job.range.start.get(),
+        end_slot: job.range.end_inclusive.get(),
+        next_slot: job.next_slot.get(),
+        end_kind: job.end_kind.as_str(),
+        blocked_reason: job
+            .blocked_reason
+            .as_ref()
+            .map(|reason| reason.as_str().to_owned()),
+        completed_at: job.completed_at.map(timestamp_text),
+        created_at: timestamp_text(job.created_at),
+    }
+}
+
+pub fn render_cancel(id: JobId, range: SlotRange, next_slot: Slot) -> CancelBody {
+    debug_assert!(range.start <= range.end_inclusive);
+    debug_assert!(next_slot >= range.start);
+    CancelBody {
+        job_id: id.get(),
+        start_slot: range.start.get(),
+        end_slot: range.end_inclusive.get(),
+        next_slot: next_slot.get(),
+        state: JobState::Cancelled,
+    }
+}
+
 fn render_volume_bucket(pool: &PoolMetadata, bucket: &VolumeBucket) -> VolumeBucketBody {
     debug_assert!(bucket.unpriced_swap_count <= bucket.swap_count);
     VolumeBucketBody {
@@ -240,7 +335,33 @@ pub fn render_pool(pool: &PoolSummary) -> PoolBody {
     }
 }
 
-pub fn render_swap(swap: &SwapRow) -> SwapBody {
+pub fn render_pool_page(page: &PoolPage, limit: PageLimit, offset: PageOffset) -> PoolListBody {
+    debug_assert!(page.pools.len() <= limit.get() as usize);
+    debug_assert!(page.pools.len() as u64 <= page.pool_count);
+    PoolListBody {
+        pools: page.pools.iter().map(render_pool).collect(),
+        page: OffsetPageBody {
+            limit: limit.get(),
+            offset: offset.get(),
+            total: page.pool_count,
+        },
+    }
+}
+
+pub fn render_swap_page(pool: PoolAddress, page: &SwapPage, limit: PageLimit) -> SwapListBody {
+    debug_assert!(page.swaps.len() <= limit.get() as usize);
+    debug_assert!(page.next_cursor.is_none() || page.swaps.len() == limit.get() as usize);
+    SwapListBody {
+        pool: pool.to_string(),
+        swaps: page.swaps.iter().map(render_swap).collect(),
+        page: CursorPageBody {
+            limit: limit.get(),
+            next_cursor: page.next_cursor.map(|cursor| cursor.encode()),
+        },
+    }
+}
+
+fn render_swap(swap: &SwapRow) -> SwapBody {
     SwapBody {
         signature: swap.signature.to_string(),
         swap_ordinal: swap.swap_ordinal.get(),
@@ -273,7 +394,6 @@ mod tests {
     use super::*;
     use dlmm_core::domain::ids::Slot;
 
-    // Human amounts shift the raw integer by the mint's decimals and never use an exponent.
     #[test]
     fn human_amount_scales_raw_by_decimals() {
         let raw = Decimal::from(1_532_123_456_789_u64);
@@ -284,8 +404,6 @@ mod tests {
         assert_eq!(human_amount(raw, None), None);
     }
 
-    // Precedence: starting without a cursor, then lagging past 120 s, then blocked jobs, then
-    // open jobs (backfilling), else ok.
     #[test]
     fn health_status_follows_cursor_lag_and_jobs() {
         let health = IndexerHealth {

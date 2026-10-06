@@ -67,8 +67,8 @@ fn optional(name: &str) -> Option<String> {
 }
 
 fn config_from_environment() -> Result<ApiConfig, ConfigError> {
-    // Reads, plus one INSERT into slot_range_job for a backfill; a read-only role here serves
-    // every read and refuses backfills.
+    // Reads, plus one INSERT into slot_range_job for a backfill and one UPDATE of it for a
+    // cancel; a read-only role here serves every read and refuses both.
     let db_dsn = std::env::var("DB_DSN").map_err(|_| ConfigError::DbDsnMissing)?;
     let rpc_url = optional("RPC_URL")
         .map(|text| {

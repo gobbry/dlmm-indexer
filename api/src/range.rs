@@ -85,9 +85,6 @@ mod tests {
         }
     }
 
-    // Hour buckets floor from and ceil to across an offset; day buckets align to UTC midnight,
-    // not the caller's, and a fractional second reaches into the next day; month ends are
-    // ordinary boundaries; an aligned range is echoed unchanged.
     #[test]
     fn align_range_floors_from_and_ceils_to_on_utc_boundaries() {
         let (hour, day) = (Bucket::Hour, Bucket::Day);
@@ -125,7 +122,6 @@ mod tests {
         assert_eq!(range, Err(RangeError::Empty));
     }
 
-    // 744 hourly buckets pass and 745 fail; 366 daily pass and 367 fail.
     #[test]
     fn bucket_count_caps_are_inclusive() {
         let start = time("2025-01-01T00:00:00Z");

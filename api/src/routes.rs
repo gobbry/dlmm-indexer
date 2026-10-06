@@ -6,13 +6,15 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use dlmm_core::domain::ids::{PoolAddress, UnixSeconds};
-use dlmm_core::domain::job::BackfillInsert;
-use dlmm_core::domain::query::{Bucket, PoolMetadata, ProjectionRead, RowCountMax};
+use dlmm_core::domain::ids::{JobId, PoolAddress, UnixSeconds};
+use dlmm_core::domain::job::{BackfillInsert, CancelOutcome};
+use dlmm_core::domain::query::{
+    Bucket, PageLimit, PageOffset, PoolMetadata, ProjectionRead, RowCountMax, SwapCursor,
+};
 use dlmm_core::gateway::rpc::{RequestLane, RpcGateway};
 use dlmm_core::store::{
-    insert_backfill_job, read_health, read_lowest_coverage_start, read_pool_metadata,
-    read_pool_volume, read_pools, read_recent_swaps,
+    cancel_job, insert_backfill_job, read_health, read_job, read_jobs, read_lowest_coverage_start,
+    read_pool_metadata, read_pool_summary, read_pool_volume, read_pools, read_swaps,
 };
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -20,19 +22,16 @@ use sqlx::PgPool;
 use crate::error::{ApiError, TimeParameter, store_failure};
 use crate::range::align_range;
 use crate::render::{
-    BackfillBody, HealthBody, PoolListBody, SwapListBody, VolumeBody, render_health, render_pool,
-    render_swap, render_volume,
+    BackfillBody, CancelBody, HealthBody, JobBody, JobListBody, PoolBody, PoolListBody,
+    SwapListBody, VolumeBody, render_cancel, render_health, render_job, render_pool,
+    render_pool_page, render_swap_page, render_volume,
 };
 
-const POOL_LIMIT_DEFAULT: u32 = 50;
-const POOL_LIMIT_MAX: u32 = 500;
-const SWAP_LIMIT_DEFAULT: u32 = 20;
-const SWAP_LIMIT_MAX: u32 = 500;
+const JOB_LIST_COUNT_MAX: RowCountMax = RowCountMax::new(50);
 
 #[derive(Clone)]
 struct ApiState {
     database: PgPool,
-    // None when the API was started without RPC_URL: backfills answer 503.
     backfill_gateway: Option<Arc<RpcGateway>>,
 }
 
@@ -45,8 +44,15 @@ struct VolumeQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct LimitQuery {
+struct PoolPageQuery {
     limit: Option<String>,
+    offset: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapPageQuery {
+    limit: Option<String>,
+    before: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,9 +64,14 @@ pub fn router(database: PgPool, backfill_gateway: Option<Arc<RpcGateway>>) -> Ro
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/pools", get(pools))
+        .route("/v1/pools/{pool}", get(pool_summary))
         .route("/v1/pools/{pool}/volume", get(volume))
         .route("/v1/pools/{pool}/swaps", get(swaps))
-        .route("/v1/backfills", post(backfill))
+        .route("/v1/backfills", post(backfill).get(backfills))
+        .route(
+            "/v1/backfills/{job_id}",
+            get(backfill_job).delete(cancel_backfill),
+        )
         .fallback(not_found)
         .with_state(ApiState {
             database,
@@ -91,16 +102,40 @@ fn parse_time(text: Option<&str>, parameter: TimeParameter) -> Result<DateTime<U
         .map_err(|_| ApiError::InvalidTime { parameter })
 }
 
-fn parse_limit(text: Option<&str>, default: u32, limit_max: u32) -> Result<RowCountMax, ApiError> {
-    debug_assert!(default >= 1);
-    debug_assert!(default <= limit_max);
-    let Some(text) = text else {
-        return Ok(RowCountMax::new(default));
-    };
-    match text.parse::<u32>() {
-        Ok(limit) if (1..=limit_max).contains(&limit) => Ok(RowCountMax::new(limit)),
-        _ => Err(ApiError::InvalidLimit { limit_max }),
+// One spelling per number, as for the cursor: u32's parser also takes a leading '+', and a
+// leading zero would make two requests for one page.
+fn parse_canonical_u32(text: &str) -> Option<u32> {
+    let digits_only = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let leading_zero = text.len() > 1 && text.starts_with('0');
+    if !digits_only || leading_zero {
+        return None;
     }
+    text.parse().ok()
+}
+
+fn parse_limit(text: Option<&str>) -> Result<PageLimit, ApiError> {
+    let Some(text) = text else {
+        return Ok(PageLimit::DEFAULT);
+    };
+    parse_canonical_u32(text)
+        .and_then(PageLimit::new)
+        .ok_or(ApiError::InvalidLimit {
+            limit_max: PageLimit::MAX,
+        })
+}
+
+fn parse_offset(text: Option<&str>) -> Result<PageOffset, ApiError> {
+    let Some(text) = text else {
+        return Ok(PageOffset::default());
+    };
+    parse_canonical_u32(text)
+        .map(PageOffset::new)
+        .ok_or(ApiError::InvalidOffset)
+}
+
+fn parse_cursor(text: Option<&str>) -> Result<Option<SwapCursor>, ApiError> {
+    text.map(|text| text.parse().map_err(|_| ApiError::InvalidCursor))
+        .transpose()
 }
 
 // Existence and labels never wait on a rebuild; only the table a request serves from may.
@@ -189,45 +224,129 @@ async fn backfill(
     }
 }
 
+fn parse_job_id(text: &str) -> Result<JobId, ApiError> {
+    match text.parse::<i64>() {
+        Ok(id) if id > 0 => Ok(JobId::new(id)),
+        _ => Err(ApiError::InvalidJobId),
+    }
+}
+
+async fn backfills(State(state): State<ApiState>) -> Result<Json<JobListBody>, ApiError> {
+    let jobs = read_jobs(&state.database, JOB_LIST_COUNT_MAX)
+        .await
+        .map_err(store_failure)?;
+    Ok(Json(JobListBody {
+        jobs: jobs.iter().map(render_job).collect(),
+    }))
+}
+
+async fn backfill_job(
+    State(state): State<ApiState>,
+    Path(job_id_text): Path<String>,
+) -> Result<Json<JobBody>, ApiError> {
+    let job_id = parse_job_id(&job_id_text)?;
+    let job = read_job(&state.database, job_id)
+        .await
+        .map_err(store_failure)?
+        .ok_or(ApiError::JobNotFound)?;
+    Ok(Json(render_job(&job)))
+}
+
+// A cancel blocks the job with reason `cancelled` instead of deleting it: a blocked job keeps
+// owning its hole, so the reconciler reopens nothing over it. Resuming is deleting that row.
+async fn cancel_backfill(
+    State(state): State<ApiState>,
+    Path(job_id_text): Path<String>,
+) -> Result<Json<CancelBody>, ApiError> {
+    let job_id = parse_job_id(&job_id_text)?;
+    match cancel_job(&state.database, job_id)
+        .await
+        .map_err(store_failure)?
+    {
+        CancelOutcome::Cancelled {
+            id,
+            range,
+            next_slot,
+        } => {
+            tracing::info!(
+                job_id = id.get(),
+                start_slot = range.start.get(),
+                end_slot = range.end_inclusive.get(),
+                next_slot = next_slot.get(),
+                "backfill_job_cancelled"
+            );
+            Ok(Json(render_cancel(id, range, next_slot)))
+        }
+        CancelOutcome::NotFound => Err(ApiError::JobNotFound),
+        CancelOutcome::AlreadyCompleted => Err(ApiError::JobAlreadyCompleted),
+        CancelOutcome::AlreadyBlocked(reason) => Err(ApiError::JobAlreadyBlocked {
+            reason: reason.as_str().to_owned(),
+        }),
+    }
+}
+
 async fn health(State(state): State<ApiState>) -> Result<Json<HealthBody>, ApiError> {
     let health = read_health(&state.database).await.map_err(store_failure)?;
     let now = UnixSeconds::new(Utc::now().timestamp());
     Ok(Json(render_health(&health, now)))
 }
 
+// Offset paging over a ranking that moves as blocks land: a pool can shift across a page
+// boundary between two requests. Accepted for a few hundred pools; swaps page by keyset.
 async fn pools(
     State(state): State<ApiState>,
-    query: Result<Query<LimitQuery>, QueryRejection>,
+    query: Result<Query<PoolPageQuery>, QueryRejection>,
 ) -> Result<Json<PoolListBody>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::InvalidQuery)?;
-    let limit = parse_limit(query.limit.as_deref(), POOL_LIMIT_DEFAULT, POOL_LIMIT_MAX)?;
-    let pools = live_rows(
-        read_pools(&state.database, limit)
+    let limit = parse_limit(query.limit.as_deref())?;
+    let offset = parse_offset(query.offset.as_deref())?;
+    let page = live_rows(
+        read_pools(&state.database, limit, offset)
             .await
             .map_err(store_failure)?,
     )?;
-    Ok(Json(PoolListBody {
-        pools: pools.iter().map(render_pool).collect(),
-    }))
+    Ok(Json(render_pool_page(&page, limit, offset)))
+}
+
+// Existence first, as for volume, so an unknown pool is a 404 even while a projection rebuilds.
+async fn pool_summary(
+    State(state): State<ApiState>,
+    Path(pool_text): Path<String>,
+) -> Result<Json<PoolBody>, ApiError> {
+    let pool = existing_pool(&state, parse_pool(&pool_text)?).await?;
+    let summary = live_rows(
+        read_pool_summary(&state.database, pool.address)
+            .await
+            .map_err(store_failure)?,
+    )?
+    // Pools are never deleted, so a pool that just existed is still there.
+    .ok_or(ApiError::PoolNotFound)?;
+    Ok(Json(render_pool(&summary)))
 }
 
 async fn swaps(
     State(state): State<ApiState>,
     Path(pool_text): Path<String>,
-    query: Result<Query<LimitQuery>, QueryRejection>,
+    query: Result<Query<SwapPageQuery>, QueryRejection>,
 ) -> Result<Json<SwapListBody>, ApiError> {
     let pool = parse_pool(&pool_text)?;
-    // Swaps come from the log, not a projection, so a rebuild does not hold them back.
-    existing_pool(&state, pool).await?;
+    // Swaps come from the log, not a projection, so a rebuild does not hold them back; it only
+    // takes away the first and last swaps that bound the scan.
+    let metadata = existing_pool(&state, pool).await?;
     let Query(query) = query.map_err(|_| ApiError::InvalidQuery)?;
-    let limit = parse_limit(query.limit.as_deref(), SWAP_LIMIT_DEFAULT, SWAP_LIMIT_MAX)?;
-    let swaps = read_recent_swaps(&state.database, pool, limit)
-        .await
-        .map_err(store_failure)?;
-    Ok(Json(SwapListBody {
-        pool: pool.to_string(),
-        swaps: swaps.iter().map(render_swap).collect(),
-    }))
+    let limit = parse_limit(query.limit.as_deref())?;
+    let before = parse_cursor(query.before.as_deref())?;
+    let page = read_swaps(
+        &state.database,
+        pool,
+        metadata.first_swap_at,
+        metadata.last_swap_at,
+        limit,
+        before,
+    )
+    .await
+    .map_err(store_failure)?;
+    Ok(Json(render_swap_page(pool, &page, limit)))
 }
 
 // Validation order is the contract: pool, existence, bucket, times, alignment, range, cap.
