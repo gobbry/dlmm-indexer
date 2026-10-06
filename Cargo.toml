@@ -41,6 +41,7 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 yellowstone-grpc-client = "=14.0.1"
 yellowstone-grpc-proto = { version = "=13.0.0", default-features = false, features = ["tonic", "tonic-compression"] }
 # rustls carries both ring and aws-lc-rs here (reqwest, sqlx), so tonic must name its provider
-# or building a TLS config panics; aws-lc-rs is already in the tree.
-tonic = { version = "0.14.6", features = ["tls-aws-lc"] }
+# or building a TLS config panics; aws-lc-rs is already in the tree. zstd is the Geyser stream's
+# wire compression (the proto's tonic-compression feature already builds it in).
+tonic = { version = "0.14.6", features = ["tls-aws-lc", "zstd"] }
 futures = "0.3.34"

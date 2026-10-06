@@ -28,18 +28,15 @@ services:
         required: false
     environment:
       DB_DSN: postgres://postgres:postgres@db:5432/dlmm
+      ARCHIVE_RPC_URL: ${ARCHIVE_RPC_URL:+http://archive:8899}
       RUST_LOG: ${RUST_LOG:-info}
-    # The archive (archive/run.sh) runs on the host; Docker Desktop resolves this name by
-    # itself, Linux needs the mapping.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 30s
     healthcheck:
-      # The processor touches /tmp/healthy on every commit, the tail poll on every tick.
+      # The processor touches /tmp/healthy on every block it commits; two minutes without one is unhealthy.
       test: ["CMD-SHELL", "test -f /tmp/healthy && test $$(( $$(date +%s) - $$(stat -c %Y /tmp/healthy) )) -lt 120"]
       interval: 15s
       timeout: 5s
@@ -73,6 +70,17 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  archive:
+    build: ./archive
+    platform: linux/amd64
+    volumes:
+      - ./archive/epochs:/epochs:ro
+    ports:
+      - "127.0.0.1:8899:8899"
+    restart: unless-stopped
+    # Stateless: it reads epoch files from files.old-faithful.net by range requests. Loading
+    # 97 epochs takes about two minutes; the indexer waits for the window meanwhile.
 
 volumes:
   db_data:

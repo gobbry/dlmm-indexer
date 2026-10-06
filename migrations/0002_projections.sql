@@ -12,11 +12,11 @@ CREATE TABLE pool_volume_1h(
 
 CREATE INDEX pool_volume_1h_bucket ON pool_volume_1h(bucket, pool) INCLUDE (swap_count, unpriced_swap_count, volume_usd);
 
+-- Same shape as pool_volume_1h; bucket is the UTC day start.
 CREATE TABLE pool_volume_1d(
     LIKE pool_volume_1h INCLUDING ALL
 );
 
--- bucket = UTC day start
 CREATE TABLE pool_stats(
     pool solana_address PRIMARY KEY,
     swap_count bigint NOT NULL,
@@ -24,8 +24,8 @@ CREATE TABLE pool_stats(
     volume_y numeric(39, 0) NOT NULL,
     volume_usd numeric(38, 18) NOT NULL,
     unpriced_swap_count bigint NOT NULL,
-    first_swap_at timestamptz NOT NULL, -- min
-    last_swap_at timestamptz NOT NULL -- max
+    first_swap_at timestamptz NOT NULL,
+    last_swap_at timestamptz NOT NULL
 );
 
 CREATE TABLE projection(

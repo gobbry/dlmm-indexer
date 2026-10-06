@@ -101,6 +101,7 @@ CREATE TABLE swap(
     source swap_source NOT NULL,
     fill_job_id bigint,
     CHECK ((source = 'fill') =(fill_job_id IS NOT NULL)),
+    -- block_time is in every unique key because a Timescale hypertable requires the partition column there.
     UNIQUE (signature, swap_ordinal, block_time)
 )
 WITH (
@@ -140,7 +141,7 @@ CREATE TABLE price(
 CREATE TABLE slot_coverage(
     start_slot bigint NOT NULL,
     end_slot bigint NOT NULL, -- inclusive, always a block's slot
-    end_block_time timestamptz NOT NULL, -- block_time of the block at end_slot
+    end_block_time timestamptz NOT NULL,
     CHECK (start_slot <= end_slot),
     EXCLUDE USING gist(int8range(start_slot, end_slot, '[]'
 ) WITH &&)
@@ -165,3 +166,6 @@ CREATE TABLE slot_range_job(
 CREATE INDEX slot_range_job_open ON slot_range_job(end_slot DESC)
 WHERE
     completed_at IS NULL AND blocked_reason IS NULL AND next_slot <= end_slot;
+
+CREATE INDEX slot_range_job_newest ON slot_range_job(created_at DESC, id DESC);
+

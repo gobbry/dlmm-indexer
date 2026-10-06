@@ -5,6 +5,8 @@ set -euo pipefail
 
 FAITHFUL_VERSION="${FAITHFUL_VERSION:-v0.7.28}"
 LISTEN="${ARCHIVE_LISTEN:-:8899}"
+# files.old-faithful.net 429s to a burst of index requests, rate limit to stay under the limit.
+EPOCH_LOAD_CONCURRENCY="${ARCHIVE_EPOCH_LOAD_CONCURRENCY:-2}"
 ARCHIVE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$ARCHIVE_DIR/bin"
 BINARY="$BIN_DIR/faithful-cli-$FAITHFUL_VERSION"
@@ -28,4 +30,11 @@ if [ ! -x "$BINARY" ]; then
   mv "$BINARY.partial" "$BINARY"
 fi
 
-exec "$BINARY" rpc --listen "$LISTEN" "$ARCHIVE_DIR/epochs"
+# Refuse when starting on the same port
+PORT="${LISTEN##*:}"
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "an archive server is already listening on :$PORT (lsof -nP -iTCP:$PORT -sTCP:LISTEN); stop it first" >&2
+  exit 1
+fi
+
+exec "$BINARY" rpc --listen "$LISTEN" --epoch-load-concurrency "$EPOCH_LOAD_CONCURRENCY" "$ARCHIVE_DIR/epochs"
